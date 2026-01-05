@@ -153,6 +153,45 @@
         "required": ["name", "value"],
         "additionalProperties": false
       }
+    },
+    {
+      "name": "debt_analyst_agent",
+      "description": "AI agent that automatically discovers and reads facts from blackboard variables in memory, then generates debt analysis hypotheses using DeepSeek reasoning model. Can auto-discover variables with 'facts' property.",
+      "api_base": "local",
+      "local_tool": "debt_analyst_agent",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "blackboard_key": {
+            "type": "string",
+            "description": "Optional: The key in memory store containing facts/data to analyze. If not provided, tool will auto-discover variables with 'facts' property or variables named 'blackboard'"
+          },
+          "context": {
+            "type": "string",
+            "description": "Additional context or specific question for the debt analyst"
+          },
+          "api_key": {
+            "type": "string",
+            "description": "OpenRouter API key (optional, can be set via environment variable OPENROUTER_API_KEY)"
+          },
+          "save_to": {
+            "type": "string",
+            "description": "Optional key to save the hypothesis results to in memory store"
+          },
+          "model": {
+            "type": "string",
+            "description": "Model to use (default: deepseek/deepseek-r1-0528:free)",
+            "default": "deepseek/deepseek-r1-0528:free"
+          },
+          "timeout": {
+            "type": "number",
+            "description": "API request timeout in seconds (default: 120). Increase if using reasoning models that need more time.",
+            "default": 120
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
     }
   ]
 }

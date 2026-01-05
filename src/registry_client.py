@@ -40,7 +40,7 @@ def create_http_client(terraform_skip_tls_verify: bool = False) -> requests.Sess
     """
     session = requests.Session()
     session.headers.update({
-        'User-Agent': 'Optum-MCP-Server-AI/1.0'
+        'User-Agent': 'Xendex-MCP-Server-AI/1.0'
     })
 
     if terraform_skip_tls_verify:

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
+import requests
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
-
+from dotenv import load_dotenv
+load_dotenv()
 
 # Session-scoped in-memory store.
 # Persists for the lifetime of the Python process.
@@ -586,3 +589,256 @@ class CreateVariableTool:
                 "overwritten": name in store and overwrite
             }
         }
+
+
+@dataclass
+class DebtAnalystTool:
+    """AI agent that analyzes debt-related facts from blackboard and generates hypotheses."""
+    
+    config: Dict[str, Any]
+
+    def __post_init__(self) -> None:
+        self.name: str = str(self.config.get("name") or "")
+        if not self.name:
+            raise ValueError("Local tool config missing required field 'name'")
+
+        self.description: str = str(
+            self.config.get("description")
+            or "AI agent that reads facts from blackboard and generates debt analysis hypotheses."
+        )
+
+        self.api_base: str = "local"
+
+        self.input_schema: Dict[str, Any] = self.config.get("input_schema") or {
+            "type": "object",
+            "properties": {
+                "blackboard_key": {
+                    "type": "string",
+                    "description": "The key in memory store containing facts/data to analyze",
+                    "default": "blackboard"
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Additional context or specific question for the debt analyst"
+                },
+                "api_key": {
+                    "type": "string",
+                    "description": "OpenRouter API key"
+                },
+                "save_to": {
+                    "type": "string",
+                    "description": "Optional key to save results to"
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Model to use",
+                    "default": "deepseek/deepseek-r1-0528:free"
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "API request timeout in seconds (default: 25). Note: MCP client has a 30-second timeout.",
+                    "default": 25
+                }
+            },
+            "required": [],
+            "additionalProperties": False,
+        }
+
+    def handle(self, session_id: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        args = arguments or {}
+        blackboard_key = args.get("blackboard_key")
+        context = args.get("context", "")
+        # Check both OPENROUTER_API_KEY and OPEN_ROUTER_API_KEY (with underscore)
+        api_key = args.get("api_key") or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPEN_ROUTER_API_KEY")
+        save_to = args.get("save_to")
+        model = args.get("model", "deepseek/deepseek-r1-0528:free")
+        timeout = args.get("timeout", 25)  # Default 25 seconds to fit within MCP client's 30-second timeout
+
+        # Validate API key
+        if not api_key:
+            return {
+                "error": "OpenRouter API key required. Provide via 'api_key' parameter or set OPENROUTER_API_KEY (or OPEN_ROUTER_API_KEY) environment variable."
+            }
+
+        # Get the store
+        store = _get_session_store(session_id)
+
+        # Read all variables from memory
+        all_variables = list(store.keys())
+        
+        if not all_variables:
+            return {
+                "error": "No variables found in memory store. Please create variables first using 'create_variable' or 'memory_store' tools."
+            }
+        
+        # Auto-discover blackboard if not specified
+        if not blackboard_key:
+            # Search for variables with 'facts' property
+            candidates = []
+            for var_name in all_variables:
+                var_value = store[var_name]
+                if isinstance(var_value, dict) and "facts" in var_value:
+                    candidates.append(var_name)
+            
+            if candidates:
+                blackboard_key = candidates[0]
+                print(f"Auto-discovered blackboard variable: {blackboard_key}")
+            else:
+                # Look for any variable named 'blackboard' or containing 'blackboard'
+                for var_name in all_variables:
+                    if "blackboard" in var_name.lower():
+                        blackboard_key = var_name
+                        print(f"Found blackboard variable: {blackboard_key}")
+                        break
+                
+                if not blackboard_key:
+                    return {
+                        "error": (
+                            f"No blackboard variable found. Available variables: {all_variables}. "
+                            "Please specify 'blackboard_key' parameter or create a variable with 'facts' property."
+                        ),
+                        "available_variables": all_variables,
+                        "hint": "Create a blackboard object with facts property, or specify which variable to analyze"
+                    }
+        
+        # Look for blackboard object with facts property
+        if blackboard_key not in store:
+            return {
+                "error": f"Blackboard key '{blackboard_key}' not found in memory store. Available keys: {all_variables}",
+                "available_variables": all_variables
+            }
+
+        blackboard_obj = store[blackboard_key]
+        
+        # Check if blackboard is an object with 'facts' property
+        if isinstance(blackboard_obj, dict) and "facts" in blackboard_obj:
+            facts = blackboard_obj["facts"]
+            metadata = {k: v for k, v in blackboard_obj.items() if k != "facts"}
+        else:
+            # If no 'facts' property, use the entire blackboard object as facts
+            facts = blackboard_obj
+            metadata = {}
+
+        # Prepare the prompt for the AI
+        prompt = self._build_prompt(facts, context, metadata, all_variables)
+
+        # Call OpenRouter API
+        try:
+            response = requests.post(
+                url="https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://github.com/xendex-mcp-server",
+                    "X-Title": "Xendex MCP Debt Analyst",
+                },
+                json={
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a debt analyst AI agent. Your role is to analyze financial facts and generate insightful hypotheses about debt situations, risks, opportunities, and recommendations."
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ]
+                },
+                timeout=timeout
+            )
+            response.raise_for_status()
+            result = response.json()
+
+            # Extract the hypothesis from the response
+            if "choices" in result and len(result["choices"]) > 0:
+                hypothesis = result["choices"][0]["message"]["content"]
+                
+                # Optionally save to memory store
+                if save_to:
+                    store[save_to] = {
+                        "hypothesis": hypothesis,
+                        "facts": facts,
+                        "context": context,
+                        "model": model,
+                        "timestamp": result.get("created")
+                    }
+
+                return {
+                    "content": {
+                        "hypothesis": hypothesis,
+                        "facts_analyzed": facts,
+                        "blackboard_key": blackboard_key,
+                        "blackboard_metadata": metadata,
+                        "all_variables": all_variables,
+                        "model_used": model,
+                        "saved_to": save_to if save_to else None,
+                        "usage": result.get("usage", {})
+                    }
+                }
+            else:
+                return {"error": "No response generated from the model"}
+
+        except requests.exceptions.RequestException as e:
+            return {"error": f"API request failed: {str(e)}"}
+        except json.JSONDecodeError as e:
+            return {"error": f"Failed to parse API response: {str(e)}"}
+        except Exception as e:
+            return {"error": f"Unexpected error: {str(e)}"}
+
+    def _build_prompt(self, facts: Any, context: str, metadata: Dict[str, Any] = None, all_variables: List[str] = None) -> str:
+        """Build the analysis prompt from facts and context."""
+        prompt_parts = [
+            "# Debt Analysis Task",
+            "",
+            "## Memory Store Context:"
+        ]
+        
+        if all_variables:
+            prompt_parts.append(f"Available variables in memory: {', '.join(all_variables)}")
+            prompt_parts.append("")
+        
+        if metadata:
+            prompt_parts.append("## Blackboard Metadata:")
+            prompt_parts.append("```json")
+            prompt_parts.append(json.dumps(metadata, indent=2))
+            prompt_parts.append("```")
+            prompt_parts.append("")
+        
+        prompt_parts.extend([
+            "## Facts from Blackboard:"
+        ])
+
+        # Format facts based on type
+        if isinstance(facts, dict):
+            prompt_parts.append("```json")
+            prompt_parts.append(json.dumps(facts, indent=2))
+            prompt_parts.append("```")
+        elif isinstance(facts, list):
+            prompt_parts.append("```json")
+            prompt_parts.append(json.dumps(facts, indent=2))
+            prompt_parts.append("```")
+        else:
+            prompt_parts.append(str(facts))
+
+        if context:
+            prompt_parts.extend([
+                "",
+                "## Additional Context:",
+                context
+            ])
+
+        prompt_parts.extend([
+            "",
+            "## Task:",
+            "Based on the facts above, generate comprehensive debt analysis hypotheses including:",
+            "1. Key insights and patterns identified",
+            "2. Risk assessment and potential concerns",
+            "3. Opportunities for debt optimization or management",
+            "4. Specific actionable recommendations",
+            "5. Any assumptions or additional information needed",
+            "",
+            "Provide a structured, detailed analysis."
+        ])
+
+        return "\n".join(prompt_parts)
