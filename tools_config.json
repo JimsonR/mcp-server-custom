@@ -1,0 +1,158 @@
+{
+  "tools": [
+    {
+      "name": "httpbin_get_ip",
+      "description": "GET https://httpbin.org/ip to show the caller IP.",
+      "api_base": "https://httpbin.org",
+      "endpoint": "/ip",
+      "method": "GET",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": true
+      }
+    },
+    {
+      "name": "httpbin_post_echo",
+      "description": "POST https://httpbin.org/post and echo back the JSON you send.",
+      "api_base": "https://httpbin.org",
+      "endpoint": "/post",
+      "method": "POST",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string",
+            "description": "Any message to echo"
+          },
+          "meta": {
+            "type": "object",
+            "description": "Optional metadata",
+            "additionalProperties": true
+          }
+        },
+        "required": ["message"],
+        "additionalProperties": true
+      }
+    },
+    {
+      "name": "memory_store",
+      "description": "Session-scoped in-memory variables/lists (set/get/append/etc).",
+      "api_base": "local",
+      "local_tool": "memory_store",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "Operation to perform",
+            "enum": ["set", "get", "delete", "keys", "clear", "append", "extend", "pop", "dump"]
+          },
+          "key": {"type": "string", "description": "Variable name"},
+          "value": {
+            "description": "JSON-serializable value",
+            "type": ["string", "number", "object", "array", "boolean", "null"]
+          },
+          "values": {
+            "description": "List of values for extend",
+            "type": "array",
+            "items": {"type": ["string", "number", "object", "array", "boolean", "null"]}
+          },
+          "default": {
+            "description": "Default returned when key is missing (get)",
+            "type": ["string", "number", "object", "array", "boolean", "null"]
+          },
+          "index": {"description": "Index for pop (defaults to -1)", "type": "integer"}
+        },
+        "required": ["action"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "memory_mutate",
+      "description": "Mutate existing in-memory variables (insert, remove, update, increment, toggle, etc.).",
+      "api_base": "local",
+      "local_tool": "memory_mutate",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "Mutation operation",
+            "enum": [
+              "list_insert",
+              "list_remove",
+              "list_reverse",
+              "list_sort",
+              "dict_update",
+              "dict_merge",
+              "dict_delete_key",
+              "dict_get_nested",
+              "dict_set_nested",
+              "increment",
+              "decrement",
+              "multiply",
+              "toggle_bool",
+              "string_concat",
+              "string_replace"
+            ]
+          },
+          "key": {"type": "string", "description": "Variable name"},
+          "index": {"type": "integer", "description": "Index for list operations"},
+          "value": {
+            "description": "Value to insert/use",
+            "type": ["string", "number", "object", "array", "boolean", "null"]
+          },
+          "old": {"type": "string", "description": "Old substring (string_replace)"},
+          "new": {"type": "string", "description": "New substring (string_replace)"},
+          "amount": {"type": "number", "description": "Amount for increment/decrement/multiply"},
+          "reverse": {"type": "boolean", "description": "Reverse sort order"},
+          "path": {
+            "type": "array",
+            "description": "Nested path for dict operations (e.g., ['a', 'b', 'c'])",
+            "items": {"type": "string"}
+          },
+          "updates": {
+            "type": "object",
+            "description": "Key-value pairs to update (dict_update/dict_merge)",
+            "additionalProperties": true
+          },
+          "dict_key": {"type": "string", "description": "Key to delete from dict"}
+        },
+        "required": ["action", "key"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "create_variable",
+      "description": "Create a new object or variable in memory with a given name and value. Supports all JSON types: strings, numbers, objects, arrays, booleans, and null.",
+      "api_base": "local",
+      "local_tool": "create_variable",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The name of the variable to create"
+          },
+          "value": {
+            "description": "The value to assign (can be any JSON type: string, number, object, array, boolean, or null)",
+            "type": ["string", "number", "object", "array", "boolean", "null"]
+          },
+          "type": {
+            "type": "string",
+            "description": "Optional type hint for the variable (e.g., 'string', 'number', 'object', 'array', 'boolean')",
+            "enum": ["string", "number", "object", "array", "boolean", "null"]
+          },
+          "overwrite": {
+            "type": "boolean",
+            "description": "Whether to overwrite if variable already exists (default: false)",
+            "default": false
+          }
+        },
+        "required": ["name", "value"],
+        "additionalProperties": false
+      }
+    }
+  ]
+}
