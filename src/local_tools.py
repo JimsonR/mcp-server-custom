@@ -596,6 +596,8 @@ class DebtAnalystTool:
     """AI agent that analyzes debt-related facts from blackboard and generates hypotheses."""
     
     config: Dict[str, Any]
+    memory_tool: Optional['MemoryStoreTool'] = None
+    mutate_tool: Optional['MemoryMutateTool'] = None
 
     def __post_init__(self) -> None:
         self.name: str = str(self.config.get("name") or "")
@@ -660,11 +662,15 @@ class DebtAnalystTool:
                 "error": "OpenRouter API key required. Provide via 'api_key' parameter or set OPENROUTER_API_KEY (or OPEN_ROUTER_API_KEY) environment variable."
             }
 
-        # Get the store
-        store = _get_session_store(session_id)
+        # Validate tools are available
+        if not self.memory_tool:
+            return {"error": "MemoryStoreTool not configured for this analyst"}
 
-        # Read all variables from memory
-        all_variables = list(store.keys())
+        # Read all variables from memory using tool
+        keys_result = self.memory_tool.handle(session_id, {"action": "keys"})
+        if "error" in keys_result:
+            return keys_result
+        all_variables = keys_result.get("content", {}).get("keys", [])
         
         if not all_variables:
             return {
@@ -676,9 +682,11 @@ class DebtAnalystTool:
             # Search for variables with 'facts' property
             candidates = []
             for var_name in all_variables:
-                var_value = store[var_name]
-                if isinstance(var_value, dict) and "facts" in var_value:
-                    candidates.append(var_name)
+                get_result = self.memory_tool.handle(session_id, {"action": "get", "key": var_name})
+                if "error" not in get_result:
+                    var_value = get_result.get("content", {}).get("value")
+                    if isinstance(var_value, dict) and "facts" in var_value:
+                        candidates.append(var_name)
             
             if candidates:
                 blackboard_key = candidates[0]
@@ -701,14 +709,20 @@ class DebtAnalystTool:
                         "hint": "Create a blackboard object with facts property, or specify which variable to analyze"
                     }
         
-        # Look for blackboard object with facts property
-        if blackboard_key not in store:
+        # Get blackboard object
+        get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
+        if "error" in get_result:
             return {
                 "error": f"Blackboard key '{blackboard_key}' not found in memory store. Available keys: {all_variables}",
                 "available_variables": all_variables
             }
-
-        blackboard_obj = store[blackboard_key]
+        
+        blackboard_obj = get_result.get("content", {}).get("value")
+        if not blackboard_obj:
+            return {
+                "error": f"Blackboard key '{blackboard_key}' is empty or not found.",
+                "available_variables": all_variables
+            }
         
         # Check if blackboard is an object with 'facts' property
         if isinstance(blackboard_obj, dict) and "facts" in blackboard_obj:
@@ -754,15 +768,44 @@ class DebtAnalystTool:
             if "choices" in result and len(result["choices"]) > 0:
                 hypothesis = result["choices"][0]["message"]["content"]
                 
-                # Optionally save to memory store
+                # Create hypothesis object
+                hypothesis_obj = {
+                    "analyst": "debt_analyst",
+                    "hypothesis": hypothesis,
+                    "context": context,
+                    "model": model,
+                    "timestamp": result.get("created"),
+                    "usage": result.get("usage", {})
+                }
+                
+                # Append hypothesis to blackboard.hypotheses if it exists
+                added_to_blackboard = False
+                if isinstance(blackboard_obj, dict) and "hypotheses" in blackboard_obj:
+                    # Get current blackboard
+                    current_bb = self.memory_tool.handle(session_id, {
+                        "action": "get",
+                        "key": blackboard_key
+                    })
+                    if "error" not in current_bb:
+                        bb_value = current_bb.get("content", {}).get("value", {})
+                        if isinstance(bb_value, dict) and "hypotheses" in bb_value:
+                            if isinstance(bb_value["hypotheses"], list):
+                                bb_value["hypotheses"].append(hypothesis_obj)
+                                # Save updated blackboard
+                                self.memory_tool.handle(session_id, {
+                                    "action": "set",
+                                    "key": blackboard_key,
+                                    "value": bb_value
+                                })
+                                added_to_blackboard = True
+                
+                # Optionally save to separate variable
                 if save_to:
-                    store[save_to] = {
-                        "hypothesis": hypothesis,
-                        "facts": facts,
-                        "context": context,
-                        "model": model,
-                        "timestamp": result.get("created")
-                    }
+                    self.memory_tool.handle(session_id, {
+                        "action": "set",
+                        "key": save_to,
+                        "value": hypothesis_obj
+                    })
 
                 return {
                     "content": {
@@ -773,6 +816,7 @@ class DebtAnalystTool:
                         "all_variables": all_variables,
                         "model_used": model,
                         "saved_to": save_to if save_to else None,
+                        "added_to_blackboard": added_to_blackboard,
                         "usage": result.get("usage", {})
                     }
                 }
@@ -849,6 +893,8 @@ class LiquidityAnalystTool:
     """AI agent that analyzes liquidity positions and cash flow."""
     
     config: Dict[str, Any]
+    memory_tool: Optional['MemoryStoreTool'] = None
+    mutate_tool: Optional['MemoryMutateTool'] = None
 
     def __post_init__(self) -> None:
         self.name: str = str(self.config.get("name") or "")
@@ -875,15 +921,26 @@ class LiquidityAnalystTool:
         if not api_key:
             return {"error": "OpenRouter API key required. Set OPENROUTER_API_KEY or OPEN_ROUTER_API_KEY environment variable."}
 
-        store = _get_session_store(session_id)
-        all_variables = list(store.keys())
+        if not self.memory_tool:
+            return {"error": "MemoryStoreTool not configured for this analyst"}
+
+        keys_result = self.memory_tool.handle(session_id, {"action": "keys"})
+        if "error" in keys_result:
+            return keys_result
+        all_variables = keys_result.get("content", {}).get("keys", [])
         
         if not all_variables:
             return {"error": "No variables found in memory store. Please create variables first."}
         
         # Auto-discover blackboard
         if not blackboard_key:
-            candidates = [k for k in all_variables if isinstance(store[k], dict) and "facts" in store[k]]
+            candidates = []
+            for k in all_variables:
+                get_result = self.memory_tool.handle(session_id, {"action": "get", "key": k})
+                if "error" not in get_result:
+                    val = get_result.get("content", {}).get("value")
+                    if isinstance(val, dict) and "facts" in val:
+                        candidates.append(k)
             if candidates:
                 blackboard_key = candidates[0]
             else:
@@ -897,10 +954,11 @@ class LiquidityAnalystTool:
                         "available_variables": all_variables
                     }
         
-        if blackboard_key not in store:
+        get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
+        if "error" in get_result:
             return {"error": f"Blackboard key '{blackboard_key}' not found.", "available_variables": all_variables}
 
-        blackboard_obj = store[blackboard_key]
+        blackboard_obj = get_result.get("content", {}).get("value")
         facts = blackboard_obj.get("facts", blackboard_obj) if isinstance(blackboard_obj, dict) else blackboard_obj
         metadata = {k: v for k, v in blackboard_obj.items() if k != "facts"} if isinstance(blackboard_obj, dict) and "facts" in blackboard_obj else {}
 
@@ -933,14 +991,32 @@ class LiquidityAnalystTool:
             if "choices" in result and len(result["choices"]) > 0:
                 analysis = result["choices"][0]["message"]["content"]
                 
+                hypothesis_obj = {
+                    "analyst": "liquidity_analyst",
+                    "analysis": analysis,
+                    "context": context,
+                    "model": model,
+                    "timestamp": result.get("created"),
+                    "usage": result.get("usage", {})
+                }
+                
+                # Append to blackboard hypotheses if available
+                added_to_blackboard = False
+                if isinstance(blackboard_obj, dict) and "hypotheses" in blackboard_obj:
+                    current_bb = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
+                    if "error" not in current_bb:
+                        bb_value = current_bb.get("content", {}).get("value", {})
+                        if isinstance(bb_value, dict) and "hypotheses" in bb_value and isinstance(bb_value["hypotheses"], list):
+                            bb_value["hypotheses"].append(hypothesis_obj)
+                            self.memory_tool.handle(session_id, {"action": "set", "key": blackboard_key, "value": bb_value})
+                            added_to_blackboard = True
+                
                 if save_to:
-                    store[save_to] = {
-                        "analysis": analysis,
-                        "facts": facts,
-                        "context": context,
-                        "model": model,
-                        "timestamp": result.get("created")
-                    }
+                    self.memory_tool.handle(session_id, {
+                        "action": "set",
+                        "key": save_to,
+                        "value": hypothesis_obj
+                    })
 
                 return {
                     "content": {
@@ -950,6 +1026,7 @@ class LiquidityAnalystTool:
                         "blackboard_metadata": metadata,
                         "model_used": model,
                         "saved_to": save_to,
+                        "added_to_blackboard": added_to_blackboard,
                         "usage": result.get("usage", {})
                     }
                 }
@@ -983,6 +1060,8 @@ class QOEAnalystTool:
     """AI agent that performs Quality of Earnings analysis."""
     
     config: Dict[str, Any]
+    memory_tool: Optional['MemoryStoreTool'] = None
+    mutate_tool: Optional['MemoryMutateTool'] = None
 
     def __post_init__(self) -> None:
         self.name: str = str(self.config.get("name") or "")
@@ -1009,15 +1088,26 @@ class QOEAnalystTool:
         if not api_key:
             return {"error": "OpenRouter API key required. Set OPENROUTER_API_KEY or OPEN_ROUTER_API_KEY environment variable."}
 
-        store = _get_session_store(session_id)
-        all_variables = list(store.keys())
+        if not self.memory_tool:
+            return {"error": "MemoryStoreTool not configured for this analyst"}
+
+        keys_result = self.memory_tool.handle(session_id, {"action": "keys"})
+        if "error" in keys_result:
+            return keys_result
+        all_variables = keys_result.get("content", {}).get("keys", [])
         
         if not all_variables:
             return {"error": "No variables found in memory store. Please create variables first."}
         
         # Auto-discover blackboard
         if not blackboard_key:
-            candidates = [k for k in all_variables if isinstance(store[k], dict) and "facts" in store[k]]
+            candidates = []
+            for k in all_variables:
+                get_result = self.memory_tool.handle(session_id, {"action": "get", "key": k})
+                if "error" not in get_result:
+                    val = get_result.get("content", {}).get("value")
+                    if isinstance(val, dict) and "facts" in val:
+                        candidates.append(k)
             if candidates:
                 blackboard_key = candidates[0]
             else:
@@ -1031,10 +1121,11 @@ class QOEAnalystTool:
                         "available_variables": all_variables
                     }
         
-        if blackboard_key not in store:
+        get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
+        if "error" in get_result:
             return {"error": f"Blackboard key '{blackboard_key}' not found.", "available_variables": all_variables}
 
-        blackboard_obj = store[blackboard_key]
+        blackboard_obj = get_result.get("content", {}).get("value")
         facts = blackboard_obj.get("facts", blackboard_obj) if isinstance(blackboard_obj, dict) else blackboard_obj
         metadata = {k: v for k, v in blackboard_obj.items() if k != "facts"} if isinstance(blackboard_obj, dict) and "facts" in blackboard_obj else {}
 
@@ -1067,14 +1158,32 @@ class QOEAnalystTool:
             if "choices" in result and len(result["choices"]) > 0:
                 analysis = result["choices"][0]["message"]["content"]
                 
+                hypothesis_obj = {
+                    "analyst": "qoe_analyst",
+                    "analysis": analysis,
+                    "context": context,
+                    "model": model,
+                    "timestamp": result.get("created"),
+                    "usage": result.get("usage", {})
+                }
+                
+                # Append to blackboard hypotheses if available
+                added_to_blackboard = False
+                if isinstance(blackboard_obj, dict) and "hypotheses" in blackboard_obj:
+                    current_bb = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
+                    if "error" not in current_bb:
+                        bb_value = current_bb.get("content", {}).get("value", {})
+                        if isinstance(bb_value, dict) and "hypotheses" in bb_value and isinstance(bb_value["hypotheses"], list):
+                            bb_value["hypotheses"].append(hypothesis_obj)
+                            self.memory_tool.handle(session_id, {"action": "set", "key": blackboard_key, "value": bb_value})
+                            added_to_blackboard = True
+                
                 if save_to:
-                    store[save_to] = {
-                        "analysis": analysis,
-                        "facts": facts,
-                        "context": context,
-                        "model": model,
-                        "timestamp": result.get("created")
-                    }
+                    self.memory_tool.handle(session_id, {
+                        "action": "set",
+                        "key": save_to,
+                        "value": hypothesis_obj
+                    })
 
                 return {
                     "content": {
@@ -1084,6 +1193,7 @@ class QOEAnalystTool:
                         "blackboard_metadata": metadata,
                         "model_used": model,
                         "saved_to": save_to,
+                        "added_to_blackboard": added_to_blackboard,
                         "usage": result.get("usage", {})
                     }
                 }
@@ -1118,6 +1228,8 @@ class AssetQualityAnalystTool:
     """AI agent that analyzes asset quality and credit risk."""
     
     config: Dict[str, Any]
+    memory_tool: Optional['MemoryStoreTool'] = None
+    mutate_tool: Optional['MemoryMutateTool'] = None
 
     def __post_init__(self) -> None:
         self.name: str = str(self.config.get("name") or "")
@@ -1144,15 +1256,26 @@ class AssetQualityAnalystTool:
         if not api_key:
             return {"error": "OpenRouter API key required. Set OPENROUTER_API_KEY or OPEN_ROUTER_API_KEY environment variable."}
 
-        store = _get_session_store(session_id)
-        all_variables = list(store.keys())
+        if not self.memory_tool:
+            return {"error": "MemoryStoreTool not configured for this analyst"}
+
+        keys_result = self.memory_tool.handle(session_id, {"action": "keys"})
+        if "error" in keys_result:
+            return keys_result
+        all_variables = keys_result.get("content", {}).get("keys", [])
         
         if not all_variables:
             return {"error": "No variables found in memory store. Please create variables first."}
         
         # Auto-discover blackboard
         if not blackboard_key:
-            candidates = [k for k in all_variables if isinstance(store[k], dict) and "facts" in store[k]]
+            candidates = []
+            for k in all_variables:
+                get_result = self.memory_tool.handle(session_id, {"action": "get", "key": k})
+                if "error" not in get_result:
+                    val = get_result.get("content", {}).get("value")
+                    if isinstance(val, dict) and "facts" in val:
+                        candidates.append(k)
             if candidates:
                 blackboard_key = candidates[0]
             else:
@@ -1166,10 +1289,11 @@ class AssetQualityAnalystTool:
                         "available_variables": all_variables
                     }
         
-        if blackboard_key not in store:
+        get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
+        if "error" in get_result:
             return {"error": f"Blackboard key '{blackboard_key}' not found.", "available_variables": all_variables}
 
-        blackboard_obj = store[blackboard_key]
+        blackboard_obj = get_result.get("content", {}).get("value")
         facts = blackboard_obj.get("facts", blackboard_obj) if isinstance(blackboard_obj, dict) else blackboard_obj
         metadata = {k: v for k, v in blackboard_obj.items() if k != "facts"} if isinstance(blackboard_obj, dict) and "facts" in blackboard_obj else {}
 
@@ -1202,14 +1326,32 @@ class AssetQualityAnalystTool:
             if "choices" in result and len(result["choices"]) > 0:
                 analysis = result["choices"][0]["message"]["content"]
                 
+                hypothesis_obj = {
+                    "analyst": "asset_quality_analyst",
+                    "analysis": analysis,
+                    "context": context,
+                    "model": model,
+                    "timestamp": result.get("created"),
+                    "usage": result.get("usage", {})
+                }
+                
+                # Append to blackboard hypotheses if available
+                added_to_blackboard = False
+                if isinstance(blackboard_obj, dict) and "hypotheses" in blackboard_obj:
+                    current_bb = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
+                    if "error" not in current_bb:
+                        bb_value = current_bb.get("content", {}).get("value", {})
+                        if isinstance(bb_value, dict) and "hypotheses" in bb_value and isinstance(bb_value["hypotheses"], list):
+                            bb_value["hypotheses"].append(hypothesis_obj)
+                            self.memory_tool.handle(session_id, {"action": "set", "key": blackboard_key, "value": bb_value})
+                            added_to_blackboard = True
+                
                 if save_to:
-                    store[save_to] = {
-                        "analysis": analysis,
-                        "facts": facts,
-                        "context": context,
-                        "model": model,
-                        "timestamp": result.get("created")
-                    }
+                    self.memory_tool.handle(session_id, {
+                        "action": "set",
+                        "key": save_to,
+                        "value": hypothesis_obj
+                    })
 
                 return {
                     "content": {
@@ -1219,6 +1361,7 @@ class AssetQualityAnalystTool:
                         "blackboard_metadata": metadata,
                         "model_used": model,
                         "saved_to": save_to,
+                        "added_to_blackboard": added_to_blackboard,
                         "usage": result.get("usage", {})
                     }
                 }

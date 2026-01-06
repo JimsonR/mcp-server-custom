@@ -121,22 +121,20 @@ class ToolRegistry:
                         tool = CreateVariableTool(tool_config)
                         self.tools[tool.name] = tool
                         logger.info(f"Registered local tool: {tool.name}")
-                    elif local_tool_type == "debt_analyst_agent":
-                        tool = DebtAnalystTool(tool_config)
+                    elif local_tool_type in ["debt_analyst_agent", "liquidity_analyst_agent", "qoe_analyst_agent", "asset_quality_analyst_agent"]:
+                        # Create analyst tool
+                        if local_tool_type == "debt_analyst_agent":
+                            tool = DebtAnalystTool(tool_config)
+                        elif local_tool_type == "liquidity_analyst_agent":
+                            tool = LiquidityAnalystTool(tool_config)
+                        elif local_tool_type == "qoe_analyst_agent":
+                            tool = QOEAnalystTool(tool_config)
+                        elif local_tool_type == "asset_quality_analyst_agent":
+                            tool = AssetQualityAnalystTool(tool_config)
+                        
+                        # Inject memory tools - will be resolved after all tools are loaded
                         self.tools[tool.name] = tool
-                        logger.info(f"Registered local tool: {tool.name}")
-                    elif local_tool_type == "liquidity_analyst_agent":
-                        tool = LiquidityAnalystTool(tool_config)
-                        self.tools[tool.name] = tool
-                        logger.info(f"Registered local tool: {tool.name}")
-                    elif local_tool_type == "qoe_analyst_agent":
-                        tool = QOEAnalystTool(tool_config)
-                        self.tools[tool.name] = tool
-                        logger.info(f"Registered local tool: {tool.name}")
-                    elif local_tool_type == "asset_quality_analyst_agent":
-                        tool = AssetQualityAnalystTool(tool_config)
-                        self.tools[tool.name] = tool
-                        logger.info(f"Registered local tool: {tool.name}")
+                        logger.info(f"Registered local tool: {tool.name} (analyst agent)")
                     else:
                         logger.warning(
                             f"Unknown local tool '{tool_name}' (local_tool={local_tool_type}), skipping"
@@ -155,6 +153,35 @@ class ToolRegistry:
                 logger.warning(
                     f"Failed to register tool '{tool_name}': {e}"
                 )
+
+        # Second pass: inject memory tools into analyst agents
+        self._inject_memory_tools_to_analysts()
+
+    def _inject_memory_tools_to_analysts(self) -> None:
+        """Inject memory_tool and mutate_tool into analyst agents after all tools are loaded."""
+        # Find memory tools
+        memory_tool = None
+        mutate_tool = None
+        
+        for tool in self.tools.values():
+            if isinstance(tool, MemoryStoreTool):
+                memory_tool = tool
+            elif isinstance(tool, MemoryMutateTool):
+                mutate_tool = tool
+        
+        if not memory_tool:
+            logger.warning("No MemoryStoreTool found - analyst agents will not have memory access")
+            return
+        
+        # Inject into analyst agents
+        analyst_count = 0
+        for tool in self.tools.values():
+            if isinstance(tool, (DebtAnalystTool, LiquidityAnalystTool, QOEAnalystTool, AssetQualityAnalystTool)):
+                tool.memory_tool = memory_tool
+                tool.mutate_tool = mutate_tool
+                analyst_count += 1
+        
+        logger.info(f"Injected memory tools into {analyst_count} analyst agent(s)")
 
     # ------------------------------------------------------------------
     # Tool access
