@@ -1056,23 +1056,62 @@ class LiquidityAnalystTool:
             return {"error": f"Analysis failed: {str(e)}"}
 
     def _build_prompt(self, facts: Any, context: str, metadata: Dict[str, Any], all_variables: List[str]) -> str:
-        prompt_parts = ["# Liquidity Analysis Task\n"]
+        """Build the analysis prompt from facts and context."""
+        prompt_parts = [
+            "# Liquidity Analysis Task",
+            "",
+            "## Memory Store Context:"
+        ]
+        
         if all_variables:
-            prompt_parts.append(f"Available variables: {', '.join(all_variables)}\n")
+            prompt_parts.append(f"Available variables in memory: {', '.join(all_variables)}")
+            prompt_parts.append("")
+        
         if metadata:
-            prompt_parts.append(f"## Metadata:\n```json\n{json.dumps(metadata, indent=2)}\n```\n")
-        prompt_parts.append(f"## Facts:\n```json\n{json.dumps(facts, indent=2) if isinstance(facts, (dict, list)) else str(facts)}\n```\n")
+            prompt_parts.append("## Blackboard Metadata:")
+            prompt_parts.append("```json")
+            prompt_parts.append(json.dumps(metadata, indent=2))
+            prompt_parts.append("```")
+            prompt_parts.append("")
+        
+        prompt_parts.extend([
+            "## Facts from Blackboard:"
+        ])
+
+        # Format facts based on type
+        if isinstance(facts, dict):
+            prompt_parts.append("```json")
+            prompt_parts.append(json.dumps(facts, indent=2))
+            prompt_parts.append("```")
+        elif isinstance(facts, list):
+            prompt_parts.append("```json")
+            prompt_parts.append(json.dumps(facts, indent=2))
+            prompt_parts.append("```")
+        else:
+            prompt_parts.append(str(facts))
+
         if context:
-            prompt_parts.append(f"## Context:\n{context}\n")
-        prompt_parts.append(
-            "\n## Task:\nAnalyze liquidity position including:\n"
-            "1. Current and quick ratio analysis\n"
-            "2. Cash flow assessment\n"
-            "3. Working capital evaluation\n"
-            "4. Liquidity risks and mitigation strategies\n"
-            "5. Short-term vs long-term liquidity position"
-        )
-        return "".join(prompt_parts)
+            prompt_parts.extend([
+                "",
+                "## Additional Context:",
+                context
+            ])
+
+        prompt_parts.extend([
+            "",
+            "## Task:",
+            "Based on the facts above, analyze liquidity position including:",
+            "1. Current and quick ratio analysis",
+            "2. Cash flow assessment and trends",
+            "3. Working capital evaluation",
+            "4. Liquidity risks and mitigation strategies",
+            "5. Short-term vs long-term liquidity position",
+            "6. Any assumptions or additional information needed",
+            "",
+            "Provide a structured, detailed analysis."
+        ])
+
+        return "\n".join(prompt_parts)
 
 
 @dataclass
@@ -1224,24 +1263,63 @@ class QOEAnalystTool:
             return {"error": f"Analysis failed: {str(e)}"}
 
     def _build_prompt(self, facts: Any, context: str, metadata: Dict[str, Any], all_variables: List[str]) -> str:
-        prompt_parts = ["# Quality of Earnings (QoE) Analysis Task\n"]
+        """Build the analysis prompt from facts and context."""
+        prompt_parts = [
+            "# Quality of Earnings (QoE) Analysis Task",
+            "",
+            "## Memory Store Context:"
+        ]
+        
         if all_variables:
-            prompt_parts.append(f"Available variables: {', '.join(all_variables)}\n")
+            prompt_parts.append(f"Available variables in memory: {', '.join(all_variables)}")
+            prompt_parts.append("")
+        
         if metadata:
-            prompt_parts.append(f"## Metadata:\n```json\n{json.dumps(metadata, indent=2)}\n```\n")
-        prompt_parts.append(f"## Facts:\n```json\n{json.dumps(facts, indent=2) if isinstance(facts, (dict, list)) else str(facts)}\n```\n")
+            prompt_parts.append("## Blackboard Metadata:")
+            prompt_parts.append("```json")
+            prompt_parts.append(json.dumps(metadata, indent=2))
+            prompt_parts.append("```")
+            prompt_parts.append("")
+        
+        prompt_parts.extend([
+            "## Facts from Blackboard:"
+        ])
+
+        # Format facts based on type
+        if isinstance(facts, dict):
+            prompt_parts.append("```json")
+            prompt_parts.append(json.dumps(facts, indent=2))
+            prompt_parts.append("```")
+        elif isinstance(facts, list):
+            prompt_parts.append("```json")
+            prompt_parts.append(json.dumps(facts, indent=2))
+            prompt_parts.append("```")
+        else:
+            prompt_parts.append(str(facts))
+
         if context:
-            prompt_parts.append(f"## Context:\n{context}\n")
-        prompt_parts.append(
-            "\n## Task:\nPerform Quality of Earnings analysis including:\n"
-            "1. Earnings sustainability and quality assessment\n"
-            "2. One-time items and adjustments identification\n"
-            "3. Revenue recognition policy evaluation\n"
-            "4. Cash vs accrual earnings comparison\n"
-            "5. Red flags and earnings manipulation indicators\n"
-            "6. Normalized earnings calculation"
-        )
-        return "".join(prompt_parts)
+            prompt_parts.extend([
+                "",
+                "## Additional Context:",
+                context
+            ])
+
+        prompt_parts.extend([
+            "",
+            "## Task:",
+            "Based on the facts above, perform Quality of Earnings analysis including:",
+            "1. Earnings sustainability and quality assessment",
+            "2. One-time items and adjustments identification",
+            "3. Revenue recognition policy evaluation",
+            "4. Cash vs accrual earnings comparison",
+            "5. Red flags and earnings manipulation indicators",
+            "6. Normalized earnings calculation",
+            "7. Any assumptions or additional information needed",
+            "",
+            "Provide a structured, detailed analysis."
+        ])
+
+        return "\n".join(prompt_parts)
 
 
 @dataclass
@@ -1393,21 +1471,60 @@ class AssetQualityAnalystTool:
             return {"error": f"Analysis failed: {str(e)}"}
 
     def _build_prompt(self, facts: Any, context: str, metadata: Dict[str, Any], all_variables: List[str]) -> str:
-        prompt_parts = ["# Asset Quality Analysis Task\n"]
+        """Build the analysis prompt from facts and context."""
+        prompt_parts = [
+            "# Asset Quality Analysis Task",
+            "",
+            "## Memory Store Context:"
+        ]
+        
         if all_variables:
-            prompt_parts.append(f"Available variables: {', '.join(all_variables)}\n")
+            prompt_parts.append(f"Available variables in memory: {', '.join(all_variables)}")
+            prompt_parts.append("")
+        
         if metadata:
-            prompt_parts.append(f"## Metadata:\n```json\n{json.dumps(metadata, indent=2)}\n```\n")
-        prompt_parts.append(f"## Facts:\n```json\n{json.dumps(facts, indent=2) if isinstance(facts, (dict, list)) else str(facts)}\n```\n")
+            prompt_parts.append("## Blackboard Metadata:")
+            prompt_parts.append("```json")
+            prompt_parts.append(json.dumps(metadata, indent=2))
+            prompt_parts.append("```")
+            prompt_parts.append("")
+        
+        prompt_parts.extend([
+            "## Facts from Blackboard:"
+        ])
+
+        # Format facts based on type
+        if isinstance(facts, dict):
+            prompt_parts.append("```json")
+            prompt_parts.append(json.dumps(facts, indent=2))
+            prompt_parts.append("```")
+        elif isinstance(facts, list):
+            prompt_parts.append("```json")
+            prompt_parts.append(json.dumps(facts, indent=2))
+            prompt_parts.append("```")
+        else:
+            prompt_parts.append(str(facts))
+
         if context:
-            prompt_parts.append(f"## Context:\n{context}\n")
-        prompt_parts.append(
-            "\n## Task:\nPerform asset quality analysis including:\n"
-            "1. Credit risk assessment and ratings\n"
-            "2. Non-performing asset (NPA) evaluation\n"
-            "3. Loan portfolio quality and diversification\n"
-            "4. Provision adequacy and impairment analysis\n"
-            "5. Concentration risk identification\n"
-            "6. Recovery rates and loss given default (LGD) estimates"
-        )
-        return "".join(prompt_parts)
+            prompt_parts.extend([
+                "",
+                "## Additional Context:",
+                context
+            ])
+
+        prompt_parts.extend([
+            "",
+            "## Task:",
+            "Based on the facts above, perform asset quality analysis including:",
+            "1. Credit risk assessment and ratings",
+            "2. Non-performing asset (NPA) evaluation",
+            "3. Loan portfolio quality and diversification",
+            "4. Provision adequacy and impairment analysis",
+            "5. Concentration risk identification",
+            "6. Recovery rates and loss given default (LGD) estimates",
+            "7. Any assumptions or additional information needed",
+            "",
+            "Provide a structured, detailed analysis."
+        ])
+
+        return "\n".join(prompt_parts)
