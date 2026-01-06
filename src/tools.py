@@ -9,7 +9,15 @@ import json
 
 # from src.search_modules import SearchModulesHandler
 from src.dynamic_tool import DynamicToolHandler
-from src.local_tools import MemoryStoreTool, MemoryMutateTool, CreateVariableTool, DebtAnalystTool
+from src.local_tools import (
+    MemoryStoreTool, 
+    MemoryMutateTool, 
+    CreateVariableTool, 
+    DebtAnalystTool,
+    LiquidityAnalystTool,
+    QOEAnalystTool,
+    AssetQualityAnalystTool
+)
 
 
 class ToolRegistry:
@@ -115,6 +123,18 @@ class ToolRegistry:
                         logger.info(f"Registered local tool: {tool.name}")
                     elif local_tool_type == "debt_analyst_agent":
                         tool = DebtAnalystTool(tool_config)
+                        self.tools[tool.name] = tool
+                        logger.info(f"Registered local tool: {tool.name}")
+                    elif local_tool_type == "liquidity_analyst_agent":
+                        tool = LiquidityAnalystTool(tool_config)
+                        self.tools[tool.name] = tool
+                        logger.info(f"Registered local tool: {tool.name}")
+                    elif local_tool_type == "qoe_analyst_agent":
+                        tool = QOEAnalystTool(tool_config)
+                        self.tools[tool.name] = tool
+                        logger.info(f"Registered local tool: {tool.name}")
+                    elif local_tool_type == "asset_quality_analyst_agent":
+                        tool = AssetQualityAnalystTool(tool_config)
                         self.tools[tool.name] = tool
                         logger.info(f"Registered local tool: {tool.name}")
                     else:

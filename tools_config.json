@@ -191,7 +191,122 @@
         },
         "required": [],
         "additionalProperties": false
+      }    },
+    {
+      "name": "liquidity_analyst_agent",
+      "description": "AI agent that analyzes liquidity positions, cash flow, and working capital from blackboard data using AI reasoning.",
+      "api_base": "local",
+      "local_tool": "liquidity_analyst_agent",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "blackboard_key": {
+            "type": "string",
+            "description": "Optional: The key in memory store containing facts/data to analyze. Auto-discovers if not provided."
+          },
+          "context": {
+            "type": "string",
+            "description": "Additional context or specific question for the liquidity analyst"
+          },
+          "api_key": {
+            "type": "string",
+            "description": "OpenRouter API key (optional, can be set via environment variable)"
+          },
+          "save_to": {
+            "type": "string",
+            "description": "Optional key to save the analysis results to in memory store"
+          },
+          "model": {
+            "type": "string",
+            "description": "Model to use (default: deepseek/deepseek-r1-0528:free)",
+            "default": "deepseek/deepseek-r1-0528:free"
+          },
+          "timeout": {
+            "type": "number",
+            "description": "API request timeout in seconds (default: 25)",
+            "default": 25
+          }
+        },
+        "required": [],
+        "additionalProperties": false
       }
-    }
+    },
+    {
+      "name": "qoe_analyst_agent",
+      "description": "AI agent that performs Quality of Earnings (QoE) analysis, evaluating earnings quality, sustainability, and potential red flags.",
+      "api_base": "local",
+      "local_tool": "qoe_analyst_agent",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "blackboard_key": {
+            "type": "string",
+            "description": "Optional: The key in memory store containing facts/data to analyze. Auto-discovers if not provided."
+          },
+          "context": {
+            "type": "string",
+            "description": "Additional context or specific question for the QoE analyst"
+          },
+          "api_key": {
+            "type": "string",
+            "description": "OpenRouter API key (optional, can be set via environment variable)"
+          },
+          "save_to": {
+            "type": "string",
+            "description": "Optional key to save the analysis results to in memory store"
+          },
+          "model": {
+            "type": "string",
+            "description": "Model to use (default: deepseek/deepseek-r1-0528:free)",
+            "default": "deepseek/deepseek-r1-0528:free"
+          },
+          "timeout": {
+            "type": "number",
+            "description": "API request timeout in seconds (default: 25)",
+            "default": 25
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "asset_quality_analyst_agent",
+      "description": "AI agent that analyzes asset quality, performing risk assessment on loans, investments, and other assets.",
+      "api_base": "local",
+      "local_tool": "asset_quality_analyst_agent",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "blackboard_key": {
+            "type": "string",
+            "description": "Optional: The key in memory store containing facts/data to analyze. Auto-discovers if not provided."
+          },
+          "context": {
+            "type": "string",
+            "description": "Additional context or specific question for the asset quality analyst"
+          },
+          "api_key": {
+            "type": "string",
+            "description": "OpenRouter API key (optional, can be set via environment variable)"
+          },
+          "save_to": {
+            "type": "string",
+            "description": "Optional key to save the analysis results to in memory store"
+          },
+          "model": {
+            "type": "string",
+            "description": "Model to use (default: deepseek/deepseek-r1-0528:free)",
+            "default": "deepseek/deepseek-r1-0528:free"
+          },
+          "timeout": {
+            "type": "number",
+            "description": "API request timeout in seconds (default: 25)",
+            "default": 25
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }    }
   ]
 }

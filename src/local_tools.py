@@ -842,3 +842,407 @@ class DebtAnalystTool:
         ])
 
         return "\n".join(prompt_parts)
+
+
+@dataclass
+class LiquidityAnalystTool:
+    """AI agent that analyzes liquidity positions and cash flow."""
+    
+    config: Dict[str, Any]
+
+    def __post_init__(self) -> None:
+        self.name: str = str(self.config.get("name") or "")
+        if not self.name:
+            raise ValueError("Local tool config missing required field 'name'")
+
+        self.description: str = str(
+            self.config.get("description")
+            or "AI agent that analyzes liquidity positions and cash flow."
+        )
+
+        self.api_base: str = "local"
+        self.input_schema: Dict[str, Any] = self.config.get("input_schema") or {}
+
+    def handle(self, session_id: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        args = arguments or {}
+        blackboard_key = args.get("blackboard_key")
+        context = args.get("context", "")
+        api_key = args.get("api_key") or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPEN_ROUTER_API_KEY")
+        save_to = args.get("save_to")
+        model = args.get("model", "deepseek/deepseek-r1-0528:free")
+        timeout = args.get("timeout", 25)
+
+        if not api_key:
+            return {"error": "OpenRouter API key required. Set OPENROUTER_API_KEY or OPEN_ROUTER_API_KEY environment variable."}
+
+        store = _get_session_store(session_id)
+        all_variables = list(store.keys())
+        
+        if not all_variables:
+            return {"error": "No variables found in memory store. Please create variables first."}
+        
+        # Auto-discover blackboard
+        if not blackboard_key:
+            candidates = [k for k in all_variables if isinstance(store[k], dict) and "facts" in store[k]]
+            if candidates:
+                blackboard_key = candidates[0]
+            else:
+                for var_name in all_variables:
+                    if "blackboard" in var_name.lower():
+                        blackboard_key = var_name
+                        break
+                if not blackboard_key:
+                    return {
+                        "error": f"No blackboard variable found. Available: {all_variables}",
+                        "available_variables": all_variables
+                    }
+        
+        if blackboard_key not in store:
+            return {"error": f"Blackboard key '{blackboard_key}' not found.", "available_variables": all_variables}
+
+        blackboard_obj = store[blackboard_key]
+        facts = blackboard_obj.get("facts", blackboard_obj) if isinstance(blackboard_obj, dict) else blackboard_obj
+        metadata = {k: v for k, v in blackboard_obj.items() if k != "facts"} if isinstance(blackboard_obj, dict) and "facts" in blackboard_obj else {}
+
+        prompt = self._build_prompt(facts, context, metadata, all_variables)
+
+        try:
+            response = requests.post(
+                url="https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://github.com/xendex-mcp-server",
+                    "X-Title": "Xendex MCP Liquidity Analyst",
+                },
+                json={
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a liquidity analyst AI agent. Analyze cash flow, working capital, current ratios, quick ratios, and liquidity positions. Identify liquidity risks and opportunities."
+                        },
+                        {"role": "user", "content": prompt}
+                    ]
+                },
+                timeout=timeout
+            )
+            response.raise_for_status()
+            result = response.json()
+
+            if "choices" in result and len(result["choices"]) > 0:
+                analysis = result["choices"][0]["message"]["content"]
+                
+                if save_to:
+                    store[save_to] = {
+                        "analysis": analysis,
+                        "facts": facts,
+                        "context": context,
+                        "model": model,
+                        "timestamp": result.get("created")
+                    }
+
+                return {
+                    "content": {
+                        "analysis": analysis,
+                        "facts_analyzed": facts,
+                        "blackboard_key": blackboard_key,
+                        "blackboard_metadata": metadata,
+                        "model_used": model,
+                        "saved_to": save_to,
+                        "usage": result.get("usage", {})
+                    }
+                }
+            return {"error": "No response generated from the model"}
+
+        except Exception as e:
+            return {"error": f"Analysis failed: {str(e)}"}
+
+    def _build_prompt(self, facts: Any, context: str, metadata: Dict[str, Any], all_variables: List[str]) -> str:
+        prompt_parts = ["# Liquidity Analysis Task\n"]
+        if all_variables:
+            prompt_parts.append(f"Available variables: {', '.join(all_variables)}\n")
+        if metadata:
+            prompt_parts.append(f"## Metadata:\n```json\n{json.dumps(metadata, indent=2)}\n```\n")
+        prompt_parts.append(f"## Facts:\n```json\n{json.dumps(facts, indent=2) if isinstance(facts, (dict, list)) else str(facts)}\n```\n")
+        if context:
+            prompt_parts.append(f"## Context:\n{context}\n")
+        prompt_parts.append(
+            "\n## Task:\nAnalyze liquidity position including:\n"
+            "1. Current and quick ratio analysis\n"
+            "2. Cash flow assessment\n"
+            "3. Working capital evaluation\n"
+            "4. Liquidity risks and mitigation strategies\n"
+            "5. Short-term vs long-term liquidity position"
+        )
+        return "".join(prompt_parts)
+
+
+@dataclass
+class QOEAnalystTool:
+    """AI agent that performs Quality of Earnings analysis."""
+    
+    config: Dict[str, Any]
+
+    def __post_init__(self) -> None:
+        self.name: str = str(self.config.get("name") or "")
+        if not self.name:
+            raise ValueError("Local tool config missing required field 'name'")
+
+        self.description: str = str(
+            self.config.get("description")
+            or "AI agent that performs Quality of Earnings analysis."
+        )
+
+        self.api_base: str = "local"
+        self.input_schema: Dict[str, Any] = self.config.get("input_schema") or {}
+
+    def handle(self, session_id: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        args = arguments or {}
+        blackboard_key = args.get("blackboard_key")
+        context = args.get("context", "")
+        api_key = args.get("api_key") or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPEN_ROUTER_API_KEY")
+        save_to = args.get("save_to")
+        model = args.get("model", "deepseek/deepseek-r1-0528:free")
+        timeout = args.get("timeout", 25)
+
+        if not api_key:
+            return {"error": "OpenRouter API key required. Set OPENROUTER_API_KEY or OPEN_ROUTER_API_KEY environment variable."}
+
+        store = _get_session_store(session_id)
+        all_variables = list(store.keys())
+        
+        if not all_variables:
+            return {"error": "No variables found in memory store. Please create variables first."}
+        
+        # Auto-discover blackboard
+        if not blackboard_key:
+            candidates = [k for k in all_variables if isinstance(store[k], dict) and "facts" in store[k]]
+            if candidates:
+                blackboard_key = candidates[0]
+            else:
+                for var_name in all_variables:
+                    if "blackboard" in var_name.lower():
+                        blackboard_key = var_name
+                        break
+                if not blackboard_key:
+                    return {
+                        "error": f"No blackboard variable found. Available: {all_variables}",
+                        "available_variables": all_variables
+                    }
+        
+        if blackboard_key not in store:
+            return {"error": f"Blackboard key '{blackboard_key}' not found.", "available_variables": all_variables}
+
+        blackboard_obj = store[blackboard_key]
+        facts = blackboard_obj.get("facts", blackboard_obj) if isinstance(blackboard_obj, dict) else blackboard_obj
+        metadata = {k: v for k, v in blackboard_obj.items() if k != "facts"} if isinstance(blackboard_obj, dict) and "facts" in blackboard_obj else {}
+
+        prompt = self._build_prompt(facts, context, metadata, all_variables)
+
+        try:
+            response = requests.post(
+                url="https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://github.com/xendex-mcp-server",
+                    "X-Title": "Xendex MCP QoE Analyst",
+                },
+                json={
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a Quality of Earnings (QoE) analyst AI agent. Evaluate earnings quality, sustainability, one-time items, accounting policies, revenue recognition, and potential earnings manipulation red flags."
+                        },
+                        {"role": "user", "content": prompt}
+                    ]
+                },
+                timeout=timeout
+            )
+            response.raise_for_status()
+            result = response.json()
+
+            if "choices" in result and len(result["choices"]) > 0:
+                analysis = result["choices"][0]["message"]["content"]
+                
+                if save_to:
+                    store[save_to] = {
+                        "analysis": analysis,
+                        "facts": facts,
+                        "context": context,
+                        "model": model,
+                        "timestamp": result.get("created")
+                    }
+
+                return {
+                    "content": {
+                        "analysis": analysis,
+                        "facts_analyzed": facts,
+                        "blackboard_key": blackboard_key,
+                        "blackboard_metadata": metadata,
+                        "model_used": model,
+                        "saved_to": save_to,
+                        "usage": result.get("usage", {})
+                    }
+                }
+            return {"error": "No response generated from the model"}
+
+        except Exception as e:
+            return {"error": f"Analysis failed: {str(e)}"}
+
+    def _build_prompt(self, facts: Any, context: str, metadata: Dict[str, Any], all_variables: List[str]) -> str:
+        prompt_parts = ["# Quality of Earnings (QoE) Analysis Task\n"]
+        if all_variables:
+            prompt_parts.append(f"Available variables: {', '.join(all_variables)}\n")
+        if metadata:
+            prompt_parts.append(f"## Metadata:\n```json\n{json.dumps(metadata, indent=2)}\n```\n")
+        prompt_parts.append(f"## Facts:\n```json\n{json.dumps(facts, indent=2) if isinstance(facts, (dict, list)) else str(facts)}\n```\n")
+        if context:
+            prompt_parts.append(f"## Context:\n{context}\n")
+        prompt_parts.append(
+            "\n## Task:\nPerform Quality of Earnings analysis including:\n"
+            "1. Earnings sustainability and quality assessment\n"
+            "2. One-time items and adjustments identification\n"
+            "3. Revenue recognition policy evaluation\n"
+            "4. Cash vs accrual earnings comparison\n"
+            "5. Red flags and earnings manipulation indicators\n"
+            "6. Normalized earnings calculation"
+        )
+        return "".join(prompt_parts)
+
+
+@dataclass
+class AssetQualityAnalystTool:
+    """AI agent that analyzes asset quality and credit risk."""
+    
+    config: Dict[str, Any]
+
+    def __post_init__(self) -> None:
+        self.name: str = str(self.config.get("name") or "")
+        if not self.name:
+            raise ValueError("Local tool config missing required field 'name'")
+
+        self.description: str = str(
+            self.config.get("description")
+            or "AI agent that analyzes asset quality and credit risk."
+        )
+
+        self.api_base: str = "local"
+        self.input_schema: Dict[str, Any] = self.config.get("input_schema") or {}
+
+    def handle(self, session_id: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        args = arguments or {}
+        blackboard_key = args.get("blackboard_key")
+        context = args.get("context", "")
+        api_key = args.get("api_key") or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPEN_ROUTER_API_KEY")
+        save_to = args.get("save_to")
+        model = args.get("model", "deepseek/deepseek-r1-0528:free")
+        timeout = args.get("timeout", 25)
+
+        if not api_key:
+            return {"error": "OpenRouter API key required. Set OPENROUTER_API_KEY or OPEN_ROUTER_API_KEY environment variable."}
+
+        store = _get_session_store(session_id)
+        all_variables = list(store.keys())
+        
+        if not all_variables:
+            return {"error": "No variables found in memory store. Please create variables first."}
+        
+        # Auto-discover blackboard
+        if not blackboard_key:
+            candidates = [k for k in all_variables if isinstance(store[k], dict) and "facts" in store[k]]
+            if candidates:
+                blackboard_key = candidates[0]
+            else:
+                for var_name in all_variables:
+                    if "blackboard" in var_name.lower():
+                        blackboard_key = var_name
+                        break
+                if not blackboard_key:
+                    return {
+                        "error": f"No blackboard variable found. Available: {all_variables}",
+                        "available_variables": all_variables
+                    }
+        
+        if blackboard_key not in store:
+            return {"error": f"Blackboard key '{blackboard_key}' not found.", "available_variables": all_variables}
+
+        blackboard_obj = store[blackboard_key]
+        facts = blackboard_obj.get("facts", blackboard_obj) if isinstance(blackboard_obj, dict) else blackboard_obj
+        metadata = {k: v for k, v in blackboard_obj.items() if k != "facts"} if isinstance(blackboard_obj, dict) and "facts" in blackboard_obj else {}
+
+        prompt = self._build_prompt(facts, context, metadata, all_variables)
+
+        try:
+            response = requests.post(
+                url="https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://github.com/xendex-mcp-server",
+                    "X-Title": "Xendex MCP Asset Quality Analyst",
+                },
+                json={
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are an asset quality analyst AI agent. Assess credit risk, loan quality, investment portfolio health, non-performing assets, provisions, and asset impairment risks."
+                        },
+                        {"role": "user", "content": prompt}
+                    ]
+                },
+                timeout=timeout
+            )
+            response.raise_for_status()
+            result = response.json()
+
+            if "choices" in result and len(result["choices"]) > 0:
+                analysis = result["choices"][0]["message"]["content"]
+                
+                if save_to:
+                    store[save_to] = {
+                        "analysis": analysis,
+                        "facts": facts,
+                        "context": context,
+                        "model": model,
+                        "timestamp": result.get("created")
+                    }
+
+                return {
+                    "content": {
+                        "analysis": analysis,
+                        "facts_analyzed": facts,
+                        "blackboard_key": blackboard_key,
+                        "blackboard_metadata": metadata,
+                        "model_used": model,
+                        "saved_to": save_to,
+                        "usage": result.get("usage", {})
+                    }
+                }
+            return {"error": "No response generated from the model"}
+
+        except Exception as e:
+            return {"error": f"Analysis failed: {str(e)}"}
+
+    def _build_prompt(self, facts: Any, context: str, metadata: Dict[str, Any], all_variables: List[str]) -> str:
+        prompt_parts = ["# Asset Quality Analysis Task\n"]
+        if all_variables:
+            prompt_parts.append(f"Available variables: {', '.join(all_variables)}\n")
+        if metadata:
+            prompt_parts.append(f"## Metadata:\n```json\n{json.dumps(metadata, indent=2)}\n```\n")
+        prompt_parts.append(f"## Facts:\n```json\n{json.dumps(facts, indent=2) if isinstance(facts, (dict, list)) else str(facts)}\n```\n")
+        if context:
+            prompt_parts.append(f"## Context:\n{context}\n")
+        prompt_parts.append(
+            "\n## Task:\nPerform asset quality analysis including:\n"
+            "1. Credit risk assessment and ratings\n"
+            "2. Non-performing asset (NPA) evaluation\n"
+            "3. Loan portfolio quality and diversification\n"
+            "4. Provision adequacy and impairment analysis\n"
+            "5. Concentration risk identification\n"
+            "6. Recovery rates and loss given default (LGD) estimates"
+        )
+        return "".join(prompt_parts)
