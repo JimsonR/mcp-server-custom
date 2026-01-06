@@ -239,6 +239,7 @@ class MemoryMutateTool:
                         "list_remove",
                         "list_reverse",
                         "list_sort",
+                        "nested_list_append",
                         "dict_update",
                         "dict_merge",
                         "dict_delete_key",
@@ -335,6 +336,33 @@ class MemoryMutateTool:
             except Exception as e:
                 return {"error": f"Cannot sort list: {e}"}
             return {"content": {"key": key, "value": existing, "length": len(existing)}}
+
+        # Nested list operations
+        if action == "nested_list_append":
+            if not isinstance(existing, dict):
+                return {"error": f"Variable '{key}' is not a dict"}
+            path = args.get("path")
+            if not isinstance(path, list) or not path:
+                return {"error": "'path' must be a non-empty array"}
+            value = args.get("value")
+            try:
+                _ensure_json_serializable(value)
+                # Navigate to parent
+                current = existing
+                for p in path[:-1]:
+                    if p not in current:
+                        current[p] = {}
+                    current = current[p]
+                # Get the list at the final path
+                list_key = path[-1]
+                if list_key not in current:
+                    current[list_key] = []
+                if not isinstance(current[list_key], list):
+                    return {"error": f"Path '{'.'.join(path)}' does not point to a list"}
+                current[list_key].append(value)
+            except Exception as e:
+                return {"error": str(e)}
+            return {"content": {"key": key, "value": existing, "path": path, "appended": True}}
 
         # Dict operations
         if action == "dict_update":
@@ -778,26 +806,17 @@ class DebtAnalystTool:
                     "usage": result.get("usage", {})
                 }
                 
-                # Append hypothesis to blackboard.hypotheses if it exists
+                # Append hypothesis to blackboard.hypotheses using tool call
                 added_to_blackboard = False
-                if isinstance(blackboard_obj, dict) and "hypotheses" in blackboard_obj:
-                    # Get current blackboard
-                    current_bb = self.memory_tool.handle(session_id, {
-                        "action": "get",
-                        "key": blackboard_key
+                if isinstance(blackboard_obj, dict) and "hypotheses" in blackboard_obj and self.mutate_tool:
+                    append_result = self.mutate_tool.handle(session_id, {
+                        "action": "nested_list_append",
+                        "key": blackboard_key,
+                        "path": ["hypotheses"],
+                        "value": hypothesis_obj
                     })
-                    if "error" not in current_bb:
-                        bb_value = current_bb.get("content", {}).get("value", {})
-                        if isinstance(bb_value, dict) and "hypotheses" in bb_value:
-                            if isinstance(bb_value["hypotheses"], list):
-                                bb_value["hypotheses"].append(hypothesis_obj)
-                                # Save updated blackboard
-                                self.memory_tool.handle(session_id, {
-                                    "action": "set",
-                                    "key": blackboard_key,
-                                    "value": bb_value
-                                })
-                                added_to_blackboard = True
+                    if "error" not in append_result:
+                        added_to_blackboard = True
                 
                 # Optionally save to separate variable
                 if save_to:
@@ -1000,16 +1019,17 @@ class LiquidityAnalystTool:
                     "usage": result.get("usage", {})
                 }
                 
-                # Append to blackboard hypotheses if available
+                # Append to blackboard hypotheses using tool call
                 added_to_blackboard = False
-                if isinstance(blackboard_obj, dict) and "hypotheses" in blackboard_obj:
-                    current_bb = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
-                    if "error" not in current_bb:
-                        bb_value = current_bb.get("content", {}).get("value", {})
-                        if isinstance(bb_value, dict) and "hypotheses" in bb_value and isinstance(bb_value["hypotheses"], list):
-                            bb_value["hypotheses"].append(hypothesis_obj)
-                            self.memory_tool.handle(session_id, {"action": "set", "key": blackboard_key, "value": bb_value})
-                            added_to_blackboard = True
+                if isinstance(blackboard_obj, dict) and "hypotheses" in blackboard_obj and self.mutate_tool:
+                    append_result = self.mutate_tool.handle(session_id, {
+                        "action": "nested_list_append",
+                        "key": blackboard_key,
+                        "path": ["hypotheses"],
+                        "value": hypothesis_obj
+                    })
+                    if "error" not in append_result:
+                        added_to_blackboard = True
                 
                 if save_to:
                     self.memory_tool.handle(session_id, {
@@ -1167,16 +1187,17 @@ class QOEAnalystTool:
                     "usage": result.get("usage", {})
                 }
                 
-                # Append to blackboard hypotheses if available
+                # Append to blackboard hypotheses using tool call
                 added_to_blackboard = False
-                if isinstance(blackboard_obj, dict) and "hypotheses" in blackboard_obj:
-                    current_bb = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
-                    if "error" not in current_bb:
-                        bb_value = current_bb.get("content", {}).get("value", {})
-                        if isinstance(bb_value, dict) and "hypotheses" in bb_value and isinstance(bb_value["hypotheses"], list):
-                            bb_value["hypotheses"].append(hypothesis_obj)
-                            self.memory_tool.handle(session_id, {"action": "set", "key": blackboard_key, "value": bb_value})
-                            added_to_blackboard = True
+                if isinstance(blackboard_obj, dict) and "hypotheses" in blackboard_obj and self.mutate_tool:
+                    append_result = self.mutate_tool.handle(session_id, {
+                        "action": "nested_list_append",
+                        "key": blackboard_key,
+                        "path": ["hypotheses"],
+                        "value": hypothesis_obj
+                    })
+                    if "error" not in append_result:
+                        added_to_blackboard = True
                 
                 if save_to:
                     self.memory_tool.handle(session_id, {
@@ -1335,16 +1356,17 @@ class AssetQualityAnalystTool:
                     "usage": result.get("usage", {})
                 }
                 
-                # Append to blackboard hypotheses if available
+                # Append to blackboard hypotheses using tool call
                 added_to_blackboard = False
-                if isinstance(blackboard_obj, dict) and "hypotheses" in blackboard_obj:
-                    current_bb = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
-                    if "error" not in current_bb:
-                        bb_value = current_bb.get("content", {}).get("value", {})
-                        if isinstance(bb_value, dict) and "hypotheses" in bb_value and isinstance(bb_value["hypotheses"], list):
-                            bb_value["hypotheses"].append(hypothesis_obj)
-                            self.memory_tool.handle(session_id, {"action": "set", "key": blackboard_key, "value": bb_value})
-                            added_to_blackboard = True
+                if isinstance(blackboard_obj, dict) and "hypotheses" in blackboard_obj and self.mutate_tool:
+                    append_result = self.mutate_tool.handle(session_id, {
+                        "action": "nested_list_append",
+                        "key": blackboard_key,
+                        "path": ["hypotheses"],
+                        "value": hypothesis_obj
+                    })
+                    if "error" not in append_result:
+                        added_to_blackboard = True
                 
                 if save_to:
                     self.memory_tool.handle(session_id, {
