@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import requests
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -11,6 +12,42 @@ load_dotenv()
 # Session-scoped in-memory store.
 # Persists for the lifetime of the Python process.
 _SESSION_STATE: Dict[str, Dict[str, Any]] = {}
+
+
+def _extract_content_from_response(content: str) -> str:
+    """Extract actual analysis content from AI response, handling DeepSeek R1 reasoning tags."""
+    if not content:
+        return ""
+    
+    # DeepSeek R1 wraps reasoning in <think> tags
+    # Case 1: Content is after </think> tag (preferred format)
+    if "</think>" in content:
+        parts = content.split("</think>")
+        if len(parts) > 1:
+            actual_content = parts[-1].strip()
+            if actual_content:
+                return actual_content
+        
+        # Case 2: If nothing after </think>, extract from inside <think>...</think>
+        # This happens when the model puts everything in the thinking block
+        if "<think>" in content:
+            # Use regex to get content between first <think> and last </think>
+            import re
+            pattern = r'<think>(.*?)</think>'
+            matches = re.findall(pattern, content, re.DOTALL)
+            if matches:
+                # Get the last match (in case of multiple think blocks)
+                inner_content = matches[-1].strip()
+                if inner_content:
+                    print(f"DEBUG: Extracting content from inside <think> tags (length: {len(inner_content)})")
+                    return inner_content
+    
+    # Case 3: No think tags, or extraction failed - return everything
+    # This is a fallback to ensure we never lose content
+    result = content.strip()
+    if result:
+        print(f"DEBUG: No think tags found or extraction failed, returning raw content (length: {len(result)})")
+    return result
 
 
 def _get_session_store(session_id: str) -> Dict[str, Any]:
@@ -626,6 +663,7 @@ class DebtAnalystTool:
     config: Dict[str, Any]
     memory_tool: Optional['MemoryStoreTool'] = None
     mutate_tool: Optional['MemoryMutateTool'] = None
+    critic_tool: Optional['CriticAgentTool'] = None  # Reference to critic agent
 
     def __post_init__(self) -> None:
         self.name: str = str(self.config.get("name") or "")
@@ -683,6 +721,8 @@ class DebtAnalystTool:
         save_to = args.get("save_to")
         model = args.get("model", "deepseek/deepseek-r1-0528:free")
         timeout = args.get("timeout", 25)  # Default 25 seconds to fit within MCP client's 30-second timeout
+        enable_self_critique = args.get("enable_self_critique", False)
+        max_iterations = args.get("max_iterations", 2)
 
         # Validate API key
         if not api_key:
@@ -705,7 +745,16 @@ class DebtAnalystTool:
                 "error": "No variables found in memory store. Please create variables first using 'create_variable' or 'memory_store' tools."
             }
         
-        # Auto-discover blackboard if not specified
+        # Check if explicitly provided blackboard_key exists and has data
+        original_blackboard_key = blackboard_key
+        if blackboard_key:
+            get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
+            if "error" in get_result or get_result.get("content", {}).get("value") is None:
+                # Explicitly provided key doesn't exist or is None, fall back to auto-discovery
+                print(f"Warning: Blackboard key '{blackboard_key}' not found or is None. Attempting auto-discovery...")
+                blackboard_key = None
+        
+        # Auto-discover blackboard if not specified or if explicit key failed
         if not blackboard_key:
             # Search for variables with 'facts' property
             candidates = []
@@ -723,21 +772,26 @@ class DebtAnalystTool:
                 # Look for any variable named 'blackboard' or containing 'blackboard'
                 for var_name in all_variables:
                     if "blackboard" in var_name.lower():
-                        blackboard_key = var_name
-                        print(f"Found blackboard variable: {blackboard_key}")
-                        break
+                        # Verify this variable has data
+                        get_result = self.memory_tool.handle(session_id, {"action": "get", "key": var_name})
+                        if "error" not in get_result:
+                            var_value = get_result.get("content", {}).get("value")
+                            if var_value is not None:
+                                blackboard_key = var_name
+                                print(f"Found blackboard variable: {blackboard_key}")
+                                break
                 
                 if not blackboard_key:
+                    error_msg = f"No blackboard variable found. Available variables: {all_variables}."
+                    if original_blackboard_key:
+                        error_msg = f"Blackboard key '{original_blackboard_key}' not found or is None. " + error_msg
                     return {
-                        "error": (
-                            f"No blackboard variable found. Available variables: {all_variables}. "
-                            "Please specify 'blackboard_key' parameter or create a variable with 'facts' property."
-                        ),
+                        "error": error_msg + " Please specify 'blackboard_key' parameter or create a variable with 'facts' property.",
                         "available_variables": all_variables,
                         "hint": "Create a blackboard object with facts property, or specify which variable to analyze"
                     }
         
-        # Get blackboard object
+        # Get blackboard object (we know it exists now)
         get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
         if "error" in get_result:
             return {
@@ -746,15 +800,20 @@ class DebtAnalystTool:
             }
         
         blackboard_obj = get_result.get("content", {}).get("value")
-        if not blackboard_obj:
+        if blackboard_obj is None:
             return {
-                "error": f"Blackboard key '{blackboard_key}' is empty or not found.",
+                "error": f"Blackboard key '{blackboard_key}' is None. Please ensure the blackboard contains data.",
                 "available_variables": all_variables
             }
         
         # Check if blackboard is an object with 'facts' property
         if isinstance(blackboard_obj, dict) and "facts" in blackboard_obj:
             facts = blackboard_obj["facts"]
+            if facts is None:
+                return {
+                    "error": f"Blackboard '{blackboard_key}' facts property is None. Please ensure facts contains data.",
+                    "available_variables": all_variables
+                }
             metadata = {k: v for k, v in blackboard_obj.items() if k != "facts"}
         else:
             # If no 'facts' property, use the entire blackboard object as facts
@@ -779,7 +838,7 @@ class DebtAnalystTool:
                     "messages": [
                         {
                             "role": "system",
-                            "content": "You are a debt analyst AI agent. Your role is to analyze financial facts and generate insightful hypotheses about debt situations, risks, opportunities, and recommendations."
+                            "content": "You are a debt analyst AI agent. Your role is to analyze financial facts and generate insightful hypotheses about debt situations, risks, opportunities, and recommendations.\n\nIMPORTANT: After your reasoning process, provide your complete final analysis. Put your analysis in the main response, not just in thinking tags."
                         },
                         {
                             "role": "user",
@@ -794,7 +853,91 @@ class DebtAnalystTool:
 
             # Extract the hypothesis from the response
             if "choices" in result and len(result["choices"]) > 0:
-                hypothesis = result["choices"][0]["message"]["content"]
+                choice = result["choices"][0]
+                message = choice.get("message", {})
+                raw_content = message.get("content", "")
+                
+                # OpenRouter separates reasoning from content for DeepSeek R1
+                # If content is empty, check the reasoning field
+                if not raw_content:
+                    reasoning = message.get("reasoning", "")
+                    if reasoning:
+                        print(f"DEBUG debt: Content empty, using reasoning field (length: {len(reasoning)})")
+                        raw_content = reasoning
+                
+                hypothesis = _extract_content_from_response(raw_content)
+                
+                # CRITICAL FIX: If extraction returns empty but we have content, use raw
+                if not hypothesis and raw_content:
+                    print(f"CRITICAL: Extraction failed for debt analyst, using raw content")
+                    print(f"Raw content length: {len(raw_content)}")
+                    print(f"First 1000 chars: {raw_content[:1000]}")
+                    hypothesis = raw_content
+                elif not hypothesis:
+                    print(f"ERROR: Empty hypothesis AND empty raw content from debt analyst")
+                
+                # Enable self-critique and refinement if requested
+                critique_history = []
+                if enable_self_critique and self.critic_tool and max_iterations > 0:
+                    for iteration in range(max_iterations):
+                        # Call critic agent to evaluate the hypothesis
+                        critique_result = self.critic_tool.handle(session_id, {
+                            "response_text": hypothesis,
+                            "agent_type": "debt_analyst",
+                            "criteria": ["completeness", "accuracy", "depth", "actionability", "evidence"],
+                            "context": context,
+                            "api_key": api_key,
+                            "model": model,
+                            "timeout": timeout
+                        })
+                        
+                        if "error" not in critique_result:
+                            critique = critique_result.get("content", {}).get("critique", "")
+                            critique_history.append({
+                                "iteration": iteration + 1,
+                                "critique": critique
+                            })
+                            
+                            # Refine the hypothesis based on critique
+                            refinement_prompt = self._build_refinement_prompt(
+                                facts, context, metadata, all_variables, hypothesis, critique
+                            )
+                            
+                            try:
+                                refinement_response = requests.post(
+                                    url="https://openrouter.ai/api/v1/chat/completions",
+                                    headers={
+                                        "Authorization": f"Bearer {api_key}",
+                                        "Content-Type": "application/json",
+                                        "HTTP-Referer": "https://github.com/xendex-mcp-server",
+                                        "X-Title": "Xendex MCP Debt Analyst Refinement",
+                                    },
+                                    json={
+                                        "model": model,
+                                        "messages": [
+                                            {
+                                                "role": "system",
+                                                "content": "You are a debt analyst AI agent. Refine your previous analysis based on critic feedback to improve quality and completeness."
+                                            },
+                                            {"role": "user", "content": refinement_prompt}
+                                        ]
+                                    },
+                                    timeout=timeout
+                                )
+                                refinement_response.raise_for_status()
+                                refinement_result = refinement_response.json()
+                                
+                                if "choices" in refinement_result and len(refinement_result["choices"]) > 0:
+                                    refined_raw = refinement_result["choices"][0]["message"]["content"]
+                                    hypothesis = _extract_content_from_response(refined_raw)
+                                    critique_history[-1]["refined_hypothesis"] = hypothesis
+                                else:
+                                    break  # Could not refine, use current hypothesis
+                            except Exception as e:
+                                critique_history[-1]["refinement_error"] = str(e)
+                                break  # Error during refinement, use current hypothesis
+                        else:
+                            break  # Critic failed, use current hypothesis
                 
                 # Create hypothesis object
                 hypothesis_obj = {
@@ -803,7 +946,10 @@ class DebtAnalystTool:
                     "context": context,
                     "model": model,
                     "timestamp": result.get("created"),
-                    "usage": result.get("usage", {})
+                    "usage": result.get("usage", {}),
+                    "self_critique_enabled": enable_self_critique,
+                    "critique_iterations": len(critique_history) if enable_self_critique else 0,
+                    "critique_history": critique_history if critique_history else None
                 }
                 
                 # Append hypothesis to blackboard.hypotheses using tool call
@@ -836,6 +982,9 @@ class DebtAnalystTool:
                         "model_used": model,
                         "saved_to": save_to if save_to else None,
                         "added_to_blackboard": added_to_blackboard,
+                        "self_critique_enabled": enable_self_critique,
+                        "critique_iterations": len(critique_history) if enable_self_critique else 0,
+                        "critique_history": critique_history if critique_history else None,
                         "usage": result.get("usage", {})
                     }
                 }
@@ -864,25 +1013,33 @@ class DebtAnalystTool:
         if metadata:
             prompt_parts.append("## Blackboard Metadata:")
             prompt_parts.append("```json")
-            prompt_parts.append(json.dumps(metadata, indent=2))
+            try:
+                prompt_parts.append(json.dumps(metadata, indent=2, default=str))
+            except Exception as e:
+                prompt_parts.append(f"Error serializing metadata: {str(e)}")
+                prompt_parts.append(str(metadata))
             prompt_parts.append("```")
             prompt_parts.append("")
         
         prompt_parts.extend([
-            "## Facts from Blackboard:"
+            "## Financial Data / Facts:",
+            ""
         ])
 
-        # Format facts based on type
-        if isinstance(facts, dict):
-            prompt_parts.append("```json")
-            prompt_parts.append(json.dumps(facts, indent=2))
-            prompt_parts.append("```")
-        elif isinstance(facts, list):
-            prompt_parts.append("```json")
-            prompt_parts.append(json.dumps(facts, indent=2))
-            prompt_parts.append("```")
-        else:
-            prompt_parts.append(str(facts))
+        # Format facts based on type with better error handling
+        try:
+            if isinstance(facts, (dict, list)):
+                prompt_parts.append("```json")
+                prompt_parts.append(json.dumps(facts, indent=2, default=str, ensure_ascii=False))
+                prompt_parts.append("```")
+            elif isinstance(facts, str):
+                prompt_parts.append(facts)
+            else:
+                prompt_parts.append(f"Data Type: {type(facts).__name__}")
+                prompt_parts.append(str(facts))
+        except Exception as e:
+            prompt_parts.append(f"[Error formatting facts: {str(e)}]")
+            prompt_parts.append(f"Raw facts (type: {type(facts).__name__}): {str(facts)[:1000]}")
 
         if context:
             prompt_parts.extend([
@@ -904,6 +1061,71 @@ class DebtAnalystTool:
             "Provide a structured, detailed analysis."
         ])
 
+        return "\n".join(prompt_parts)
+
+    def _build_refinement_prompt(self, facts: Any, context: str, metadata: Dict[str, Any], all_variables: List[str], 
+                                  previous_hypothesis: str, critique: str) -> str:
+        """Build a prompt for refining the hypothesis based on critique."""
+        prompt_parts = [
+            "# Hypothesis Refinement Task",
+            "",
+            "## Original Analysis Context:",
+            "### Memory Store Context:"
+        ]
+        
+        if all_variables:
+            prompt_parts.append(f"Available variables: {', '.join(all_variables)}")
+            prompt_parts.append("")
+        
+        if metadata:
+            prompt_parts.append("### Blackboard Metadata:")
+            prompt_parts.append("```json")
+            try:
+                prompt_parts.append(json.dumps(metadata, indent=2, default=str))
+            except Exception:
+                prompt_parts.append(str(metadata))
+            prompt_parts.append("```")
+            prompt_parts.append("")
+        
+        prompt_parts.extend([
+            "### Financial Data / Facts:",
+            ""
+        ])
+        
+        try:
+            if isinstance(facts, (dict, list)):
+                prompt_parts.append("```json")
+                prompt_parts.append(json.dumps(facts, indent=2, default=str, ensure_ascii=False))
+                prompt_parts.append("```")
+            else:
+                prompt_parts.append(str(facts))
+        except Exception:
+            prompt_parts.append(str(facts)[:1000])
+        
+        if context:
+            prompt_parts.extend([
+                "",
+                "### Additional Context:",
+                context
+            ])
+        
+        prompt_parts.extend([
+            "",
+            "## Your Previous Hypothesis:",
+            "```",
+            previous_hypothesis,
+            "```",
+            "",
+            "## Critic's Feedback:",
+            "```",
+            critique,
+            "```",
+            "",
+            "## Task:",
+            "Refine your debt analysis hypothesis by addressing the critic's feedback. Maintain the strengths identified while improving weaknesses, filling gaps, and strengthening your evidence and recommendations. Provide a complete, revised analysis that incorporates the constructive feedback.",
+            ""
+        ])
+        
         return "\n".join(prompt_parts)
 
 
@@ -951,7 +1173,15 @@ class LiquidityAnalystTool:
         if not all_variables:
             return {"error": "No variables found in memory store. Please create variables first."}
         
-        # Auto-discover blackboard
+        # Check if explicitly provided blackboard_key exists and has data
+        original_blackboard_key = blackboard_key
+        if blackboard_key:
+            get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
+            if "error" in get_result or get_result.get("content", {}).get("value") is None:
+                print(f"Warning: Blackboard key '{blackboard_key}' not found or is None. Attempting auto-discovery...")
+                blackboard_key = None
+        
+        # Auto-discover blackboard if not specified or if explicit key failed
         if not blackboard_key:
             candidates = []
             for k in all_variables:
@@ -962,24 +1192,48 @@ class LiquidityAnalystTool:
                         candidates.append(k)
             if candidates:
                 blackboard_key = candidates[0]
+                print(f"Auto-discovered blackboard variable: {blackboard_key}")
             else:
                 for var_name in all_variables:
                     if "blackboard" in var_name.lower():
-                        blackboard_key = var_name
-                        break
+                        get_result = self.memory_tool.handle(session_id, {"action": "get", "key": var_name})
+                        if "error" not in get_result and get_result.get("content", {}).get("value") is not None:
+                            blackboard_key = var_name
+                            print(f"Found blackboard variable: {blackboard_key}")
+                            break
                 if not blackboard_key:
+                    error_msg = f"No blackboard variable found. Available: {all_variables}"
+                    if original_blackboard_key:
+                        error_msg = f"Blackboard key '{original_blackboard_key}' not found or is None. " + error_msg
                     return {
-                        "error": f"No blackboard variable found. Available: {all_variables}",
+                        "error": error_msg,
                         "available_variables": all_variables
                     }
         
+        # Get blackboard object (we know it exists now)
         get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
         if "error" in get_result:
             return {"error": f"Blackboard key '{blackboard_key}' not found.", "available_variables": all_variables}
 
         blackboard_obj = get_result.get("content", {}).get("value")
-        facts = blackboard_obj.get("facts", blackboard_obj) if isinstance(blackboard_obj, dict) else blackboard_obj
-        metadata = {k: v for k, v in blackboard_obj.items() if k != "facts"} if isinstance(blackboard_obj, dict) and "facts" in blackboard_obj else {}
+        if blackboard_obj is None:
+            return {
+                "error": f"Blackboard key '{blackboard_key}' is None. Please ensure the blackboard contains data.",
+                "available_variables": all_variables
+            }
+        
+        # Extract facts and metadata
+        if isinstance(blackboard_obj, dict) and "facts" in blackboard_obj:
+            facts = blackboard_obj["facts"]
+            if facts is None:
+                return {
+                    "error": f"Blackboard '{blackboard_key}' facts property is None. Please ensure facts contains data.",
+                    "available_variables": all_variables
+                }
+            metadata = {k: v for k, v in blackboard_obj.items() if k != "facts"}
+        else:
+            facts = blackboard_obj
+            metadata = {}
 
         prompt = self._build_prompt(facts, context, metadata, all_variables)
 
@@ -997,7 +1251,7 @@ class LiquidityAnalystTool:
                     "messages": [
                         {
                             "role": "system",
-                            "content": "You are a liquidity analyst AI agent. Analyze cash flow, working capital, current ratios, quick ratios, and liquidity positions. Identify liquidity risks and opportunities."
+                            "content": "You are a liquidity analyst AI agent. Analyze cash flow, working capital, current ratios, quick ratios, and liquidity positions. Identify liquidity risks and opportunities.\n\nIMPORTANT: After your reasoning process, provide your complete final analysis. Put your analysis in the main response, not just in thinking tags."
                         },
                         {"role": "user", "content": prompt}
                     ]
@@ -1008,7 +1262,34 @@ class LiquidityAnalystTool:
             result = response.json()
 
             if "choices" in result and len(result["choices"]) > 0:
-                analysis = result["choices"][0]["message"]["content"]
+                # Debug: Log the entire choice structure
+                choice = result["choices"][0]
+                print(f"DEBUG liquidity: Full choice keys: {choice.keys()}")
+                message = choice.get("message", {})
+                print(f"DEBUG liquidity: Message keys: {message.keys()}")
+                
+                raw_content = message.get("content", "")
+                print(f"DEBUG liquidity: Raw content type: {type(raw_content)}, length: {len(raw_content) if raw_content else 0}")
+                
+                # OpenRouter separates reasoning from content for DeepSeek R1
+                # If content is empty, check the reasoning field
+                if not raw_content:
+                    reasoning = message.get("reasoning", "")
+                    if reasoning:
+                        print(f"DEBUG liquidity: Content empty, using reasoning field (length: {len(reasoning)})")
+                        raw_content = reasoning
+                
+                analysis = _extract_content_from_response(raw_content)
+                
+                # CRITICAL FIX: If extraction returns empty but we have content, use raw
+                if not analysis and raw_content:
+                    print(f"CRITICAL: Extraction failed for liquidity analyst, using raw content")
+                    print(f"Raw content length: {len(raw_content)}")
+                    print(f"First 1000 chars: {raw_content[:1000]}")
+                    # Use the raw content as-is (includes thinking tags, but better than nothing)
+                    analysis = raw_content
+                elif not analysis:
+                    print(f"ERROR: Empty analysis AND empty raw content from liquidity analyst")
                 
                 hypothesis_obj = {
                     "analyst": "liquidity_analyst",
@@ -1070,25 +1351,33 @@ class LiquidityAnalystTool:
         if metadata:
             prompt_parts.append("## Blackboard Metadata:")
             prompt_parts.append("```json")
-            prompt_parts.append(json.dumps(metadata, indent=2))
+            try:
+                prompt_parts.append(json.dumps(metadata, indent=2, default=str))
+            except Exception as e:
+                prompt_parts.append(f"Error serializing metadata: {str(e)}")
+                prompt_parts.append(str(metadata))
             prompt_parts.append("```")
             prompt_parts.append("")
         
         prompt_parts.extend([
-            "## Facts from Blackboard:"
+            "## Financial Data / Facts:",
+            ""
         ])
 
-        # Format facts based on type
-        if isinstance(facts, dict):
-            prompt_parts.append("```json")
-            prompt_parts.append(json.dumps(facts, indent=2))
-            prompt_parts.append("```")
-        elif isinstance(facts, list):
-            prompt_parts.append("```json")
-            prompt_parts.append(json.dumps(facts, indent=2))
-            prompt_parts.append("```")
-        else:
-            prompt_parts.append(str(facts))
+        # Format facts based on type with better error handling
+        try:
+            if isinstance(facts, (dict, list)):
+                prompt_parts.append("```json")
+                prompt_parts.append(json.dumps(facts, indent=2, default=str, ensure_ascii=False))
+                prompt_parts.append("```")
+            elif isinstance(facts, str):
+                prompt_parts.append(facts)
+            else:
+                prompt_parts.append(f"Data Type: {type(facts).__name__}")
+                prompt_parts.append(str(facts))
+        except Exception as e:
+            prompt_parts.append(f"[Error formatting facts: {str(e)}]")
+            prompt_parts.append(f"Raw facts (type: {type(facts).__name__}): {str(facts)[:1000]}")
 
         if context:
             prompt_parts.extend([
@@ -1158,7 +1447,15 @@ class QOEAnalystTool:
         if not all_variables:
             return {"error": "No variables found in memory store. Please create variables first."}
         
-        # Auto-discover blackboard
+        # Check if explicitly provided blackboard_key exists and has data
+        original_blackboard_key = blackboard_key
+        if blackboard_key:
+            get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
+            if "error" in get_result or get_result.get("content", {}).get("value") is None:
+                print(f"Warning: Blackboard key '{blackboard_key}' not found or is None. Attempting auto-discovery...")
+                blackboard_key = None
+        
+        # Auto-discover blackboard if not specified or if explicit key failed
         if not blackboard_key:
             candidates = []
             for k in all_variables:
@@ -1169,24 +1466,47 @@ class QOEAnalystTool:
                         candidates.append(k)
             if candidates:
                 blackboard_key = candidates[0]
+                print(f"Auto-discovered blackboard variable: {blackboard_key}")
             else:
                 for var_name in all_variables:
                     if "blackboard" in var_name.lower():
-                        blackboard_key = var_name
-                        break
+                        get_result = self.memory_tool.handle(session_id, {"action": "get", "key": var_name})
+                        if "error" not in get_result and get_result.get("content", {}).get("value") is not None:
+                            print(f"Found blackboard variable: {blackboard_key}")
+                            break
                 if not blackboard_key:
+                    error_msg = f"No blackboard variable found. Available: {all_variables}"
+                    if original_blackboard_key:
+                        error_msg = f"Blackboard key '{original_blackboard_key}' not found or is None. " + error_msg
                     return {
-                        "error": f"No blackboard variable found. Available: {all_variables}",
+                        "error": error_msg,
                         "available_variables": all_variables
                     }
         
+        # Get blackboard object (we know it exists now)
         get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
         if "error" in get_result:
             return {"error": f"Blackboard key '{blackboard_key}' not found.", "available_variables": all_variables}
 
         blackboard_obj = get_result.get("content", {}).get("value")
-        facts = blackboard_obj.get("facts", blackboard_obj) if isinstance(blackboard_obj, dict) else blackboard_obj
-        metadata = {k: v for k, v in blackboard_obj.items() if k != "facts"} if isinstance(blackboard_obj, dict) and "facts" in blackboard_obj else {}
+        if blackboard_obj is None:
+            return {
+                "error": f"Blackboard key '{blackboard_key}' is None. Please ensure the blackboard contains data.",
+                "available_variables": all_variables
+            }
+        
+        # Extract facts and metadata
+        if isinstance(blackboard_obj, dict) and "facts" in blackboard_obj:
+            facts = blackboard_obj["facts"]
+            if facts is None:
+                return {
+                    "error": f"Blackboard '{blackboard_key}' facts property is None. Please ensure facts contains data.",
+                    "available_variables": all_variables
+                }
+            metadata = {k: v for k, v in blackboard_obj.items() if k != "facts"}
+        else:
+            facts = blackboard_obj
+            metadata = {}
 
         prompt = self._build_prompt(facts, context, metadata, all_variables)
 
@@ -1204,7 +1524,7 @@ class QOEAnalystTool:
                     "messages": [
                         {
                             "role": "system",
-                            "content": "You are a Quality of Earnings (QoE) analyst AI agent. Evaluate earnings quality, sustainability, one-time items, accounting policies, revenue recognition, and potential earnings manipulation red flags."
+                            "content": "You are a Quality of Earnings (QoE) analyst AI agent. Evaluate earnings quality, sustainability, one-time items, accounting policies, revenue recognition, and potential earnings manipulation red flags.\n\nIMPORTANT: After your reasoning process, provide your complete final analysis. Put your analysis in the main response, not just in thinking tags."
                         },
                         {"role": "user", "content": prompt}
                     ]
@@ -1215,7 +1535,13 @@ class QOEAnalystTool:
             result = response.json()
 
             if "choices" in result and len(result["choices"]) > 0:
-                analysis = result["choices"][0]["message"]["content"]
+                raw_content = result["choices"][0]["message"]["content"]
+                analysis = _extract_content_from_response(raw_content)
+                
+                # Debug: Log if analysis is empty
+                if not analysis:
+                    print(f"WARNING: Empty analysis extracted from QoE analyst response")
+                    print(f"Raw content length: {len(raw_content)}")
                 
                 hypothesis_obj = {
                     "analyst": "qoe_analyst",
@@ -1277,25 +1603,33 @@ class QOEAnalystTool:
         if metadata:
             prompt_parts.append("## Blackboard Metadata:")
             prompt_parts.append("```json")
-            prompt_parts.append(json.dumps(metadata, indent=2))
+            try:
+                prompt_parts.append(json.dumps(metadata, indent=2, default=str))
+            except Exception as e:
+                prompt_parts.append(f"Error serializing metadata: {str(e)}")
+                prompt_parts.append(str(metadata))
             prompt_parts.append("```")
             prompt_parts.append("")
         
         prompt_parts.extend([
-            "## Facts from Blackboard:"
+            "## Financial Data / Facts:",
+            ""
         ])
 
-        # Format facts based on type
-        if isinstance(facts, dict):
-            prompt_parts.append("```json")
-            prompt_parts.append(json.dumps(facts, indent=2))
-            prompt_parts.append("```")
-        elif isinstance(facts, list):
-            prompt_parts.append("```json")
-            prompt_parts.append(json.dumps(facts, indent=2))
-            prompt_parts.append("```")
-        else:
-            prompt_parts.append(str(facts))
+        # Format facts based on type with better error handling
+        try:
+            if isinstance(facts, (dict, list)):
+                prompt_parts.append("```json")
+                prompt_parts.append(json.dumps(facts, indent=2, default=str, ensure_ascii=False))
+                prompt_parts.append("```")
+            elif isinstance(facts, str):
+                prompt_parts.append(facts)
+            else:
+                prompt_parts.append(f"Data Type: {type(facts).__name__}")
+                prompt_parts.append(str(facts))
+        except Exception as e:
+            prompt_parts.append(f"[Error formatting facts: {str(e)}]")
+            prompt_parts.append(f"Raw facts (type: {type(facts).__name__}): {str(facts)[:1000]}")
 
         if context:
             prompt_parts.extend([
@@ -1366,7 +1700,15 @@ class AssetQualityAnalystTool:
         if not all_variables:
             return {"error": "No variables found in memory store. Please create variables first."}
         
-        # Auto-discover blackboard
+        # Check if explicitly provided blackboard_key exists and has data
+        original_blackboard_key = blackboard_key
+        if blackboard_key:
+            get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
+            if "error" in get_result or get_result.get("content", {}).get("value") is None:
+                print(f"Warning: Blackboard key '{blackboard_key}' not found or is None. Attempting auto-discovery...")
+                blackboard_key = None
+        
+        # Auto-discover blackboard if not specified or if explicit key failed
         if not blackboard_key:
             candidates = []
             for k in all_variables:
@@ -1377,14 +1719,21 @@ class AssetQualityAnalystTool:
                         candidates.append(k)
             if candidates:
                 blackboard_key = candidates[0]
+                print(f"Auto-discovered blackboard variable: {blackboard_key}")
             else:
                 for var_name in all_variables:
                     if "blackboard" in var_name.lower():
-                        blackboard_key = var_name
-                        break
+                        get_result = self.memory_tool.handle(session_id, {"action": "get", "key": var_name})
+                        if "error" not in get_result and get_result.get("content", {}).get("value") is not None:
+                            blackboard_key = var_name
+                            print(f"Found blackboard variable: {blackboard_key}")
+                            break
                 if not blackboard_key:
+                    error_msg = f"No blackboard variable found. Available: {all_variables}"
+                    if original_blackboard_key:
+                        error_msg = f"Blackboard key '{original_blackboard_key}' not found or is None. " + error_msg
                     return {
-                        "error": f"No blackboard variable found. Available: {all_variables}",
+                        "error": error_msg,
                         "available_variables": all_variables
                     }
         
@@ -1393,8 +1742,24 @@ class AssetQualityAnalystTool:
             return {"error": f"Blackboard key '{blackboard_key}' not found.", "available_variables": all_variables}
 
         blackboard_obj = get_result.get("content", {}).get("value")
-        facts = blackboard_obj.get("facts", blackboard_obj) if isinstance(blackboard_obj, dict) else blackboard_obj
-        metadata = {k: v for k, v in blackboard_obj.items() if k != "facts"} if isinstance(blackboard_obj, dict) and "facts" in blackboard_obj else {}
+        if blackboard_obj is None:
+            return {
+                "error": f"Blackboard key '{blackboard_key}' is None. Please ensure the blackboard contains data.",
+                "available_variables": all_variables
+            }
+        
+        # Extract facts and metadata
+        if isinstance(blackboard_obj, dict) and "facts" in blackboard_obj:
+            facts = blackboard_obj["facts"]
+            if facts is None:
+                return {
+                    "error": f"Blackboard '{blackboard_key}' facts property is None. Please ensure facts contains data.",
+                    "available_variables": all_variables
+                }
+            metadata = {k: v for k, v in blackboard_obj.items() if k != "facts"}
+        else:
+            facts = blackboard_obj
+            metadata = {}
 
         prompt = self._build_prompt(facts, context, metadata, all_variables)
 
@@ -1412,7 +1777,7 @@ class AssetQualityAnalystTool:
                     "messages": [
                         {
                             "role": "system",
-                            "content": "You are an asset quality analyst AI agent. Assess credit risk, loan quality, investment portfolio health, non-performing assets, provisions, and asset impairment risks."
+                            "content": "You are an asset quality analyst AI agent. Assess credit risk, loan quality, investment portfolio health, non-performing assets, provisions, and asset impairment risks.\n\nIMPORTANT: After your reasoning process, provide your complete final analysis. Put your analysis in the main response, not just in thinking tags."
                         },
                         {"role": "user", "content": prompt}
                     ]
@@ -1423,7 +1788,13 @@ class AssetQualityAnalystTool:
             result = response.json()
 
             if "choices" in result and len(result["choices"]) > 0:
-                analysis = result["choices"][0]["message"]["content"]
+                raw_content = result["choices"][0]["message"]["content"]
+                analysis = _extract_content_from_response(raw_content)
+                
+                # Debug: Log if analysis is empty
+                if not analysis:
+                    print(f"WARNING: Empty analysis extracted from asset quality analyst response")
+                    print(f"Raw content length: {len(raw_content)}")
                 
                 hypothesis_obj = {
                     "analyst": "asset_quality_analyst",
@@ -1485,25 +1856,33 @@ class AssetQualityAnalystTool:
         if metadata:
             prompt_parts.append("## Blackboard Metadata:")
             prompt_parts.append("```json")
-            prompt_parts.append(json.dumps(metadata, indent=2))
+            try:
+                prompt_parts.append(json.dumps(metadata, indent=2, default=str))
+            except Exception as e:
+                prompt_parts.append(f"Error serializing metadata: {str(e)}")
+                prompt_parts.append(str(metadata))
             prompt_parts.append("```")
             prompt_parts.append("")
         
         prompt_parts.extend([
-            "## Facts from Blackboard:"
+            "## Financial Data / Facts:",
+            ""
         ])
 
-        # Format facts based on type
-        if isinstance(facts, dict):
-            prompt_parts.append("```json")
-            prompt_parts.append(json.dumps(facts, indent=2))
-            prompt_parts.append("```")
-        elif isinstance(facts, list):
-            prompt_parts.append("```json")
-            prompt_parts.append(json.dumps(facts, indent=2))
-            prompt_parts.append("```")
-        else:
-            prompt_parts.append(str(facts))
+        # Format facts based on type with better error handling
+        try:
+            if isinstance(facts, (dict, list)):
+                prompt_parts.append("```json")
+                prompt_parts.append(json.dumps(facts, indent=2, default=str, ensure_ascii=False))
+                prompt_parts.append("```")
+            elif isinstance(facts, str):
+                prompt_parts.append(facts)
+            else:
+                prompt_parts.append(f"Data Type: {type(facts).__name__}")
+                prompt_parts.append(str(facts))
+        except Exception as e:
+            prompt_parts.append(f"[Error formatting facts: {str(e)}]")
+            prompt_parts.append(f"Raw facts (type: {type(facts).__name__}): {str(facts)[:1000]}")
 
         if context:
             prompt_parts.extend([
@@ -1525,6 +1904,453 @@ class AssetQualityAnalystTool:
             "7. Any assumptions or additional information needed",
             "",
             "Provide a structured, detailed analysis."
+        ])
+
+        return "\n".join(prompt_parts)
+
+
+@dataclass
+class ConsolidatedCriticTool:
+    """Batch critique multiple analyst responses for cost-efficient cross-analysis."""
+    
+    config: Dict[str, Any]
+    memory_tool: Optional['MemoryStoreTool'] = None
+
+    def __post_init__(self) -> None:
+        self.name: str = str(self.config.get("name") or "")
+        if not self.name:
+            raise ValueError("Local tool config missing required field 'name'")
+
+        self.description: str = str(
+            self.config.get("description")
+            or "Batch critique multiple analyst responses together for cost efficiency."
+        )
+
+        self.api_base: str = "local"
+        self.input_schema: Dict[str, Any] = self.config.get("input_schema") or {}
+
+    def handle(self, session_id: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        args = arguments or {}
+        analyst_responses = args.get("analyst_responses", [])
+        critique_mode = args.get("critique_mode", "cross_analysis")
+        use_cheap_model = args.get("use_cheap_model", True)
+        context = args.get("context", "")
+        api_key = args.get("api_key") or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPEN_ROUTER_API_KEY")
+        save_to = args.get("save_to")
+        timeout = args.get("timeout", 60)
+        
+        # Model selection based on cost preference
+        if args.get("model"):
+            model = args["model"]
+        else:
+            model = "deepseek/deepseek-r1-0528:free"
+
+        if not api_key:
+            return {"error": "OpenRouter API key required. Set OPENROUTER_API_KEY or OPEN_ROUTER_API_KEY environment variable."}
+
+        if not analyst_responses or len(analyst_responses) == 0:
+            return {"error": "No analyst responses provided. Please provide at least one analyst response."}
+
+        # Collect all analyst responses
+        collected_responses = []
+        for resp_obj in analyst_responses:
+            agent_type = resp_obj.get("agent", "unknown")
+            response_text = resp_obj.get("response")
+            response_key = resp_obj.get("response_key")
+            
+            # Try to get response from memory if key provided
+            if not response_text and response_key and self.memory_tool:
+                get_result = self.memory_tool.handle(session_id, {"action": "get", "key": response_key})
+                if "error" not in get_result:
+                    response_value = get_result.get("content", {}).get("value")
+                    if isinstance(response_value, dict):
+                        response_text = response_value.get("analysis") or response_value.get("hypothesis") or str(response_value)
+                    else:
+                        response_text = str(response_value)
+            
+            if response_text:
+                collected_responses.append({
+                    "agent": agent_type,
+                    "response": response_text
+                })
+
+        if not collected_responses:
+            return {"error": "Could not retrieve any analyst responses. Check response_key values or provide response text."}
+
+        # Build consolidated critique prompt
+        prompt = self._build_consolidated_prompt(collected_responses, critique_mode, context)
+
+        # Call OpenRouter API
+        try:
+            response = requests.post(
+                url="https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://github.com/xendex-mcp-server",
+                    "X-Title": "Xendex MCP Consolidated Critic",
+                },
+                json={
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a senior financial analyst reviewing multiple analyst reports. Your role is to identify conflicts, inconsistencies, gaps, and provide consolidated feedback across all analyses. Focus on cross-validation and synthesis."
+                        },
+                        {"role": "user", "content": prompt}
+                    ]
+                },
+                timeout=timeout
+            )
+            response.raise_for_status()
+            result = response.json()
+
+            if "choices" in result and len(result["choices"]) > 0:
+                choice = result["choices"][0]
+                message = choice.get("message", {})
+                raw_content = message.get("content", "")
+                
+                # OpenRouter separates reasoning from content for DeepSeek R1
+                # If content is empty, check the reasoning field
+                if not raw_content:
+                    reasoning = message.get("reasoning", "")
+                    if reasoning:
+                        print(f"DEBUG consolidated_critic: Content empty, using reasoning field (length: {len(reasoning)})")
+                        raw_content = reasoning
+                
+                critique = _extract_content_from_response(raw_content)
+                
+                # Debug: Log if critique is empty
+                if not critique:
+                    print(f"WARNING: Empty critique extracted from consolidated critic response")
+                    print(f"Raw content length: {len(raw_content)}")
+                
+                critique_obj = {
+                    "consolidated_critic": "consolidated_analyst_critique",
+                    "critique": critique,
+                    "critique_mode": critique_mode,
+                    "num_analysts_reviewed": len(collected_responses),
+                    "analysts": [r["agent"] for r in collected_responses],
+                    "model": model,
+                    "cost_efficient": use_cheap_model,
+                    "timestamp": result.get("created"),
+                    "usage": result.get("usage", {})
+                }
+                
+                # Save the critique if requested
+                if save_to and self.memory_tool:
+                    self.memory_tool.handle(session_id, {
+                        "action": "set",
+                        "key": save_to,
+                        "value": critique_obj
+                    })
+
+                return {
+                    "content": {
+                        "critique": critique,
+                        "critique_mode": critique_mode,
+                        "num_analysts_reviewed": len(collected_responses),
+                        "analysts_reviewed": [r["agent"] for r in collected_responses],
+                        "model_used": model,
+                        "cost_efficient": use_cheap_model,
+                        "saved_to": save_to if save_to else None,
+                        "usage": result.get("usage", {}),
+                        "estimated_cost_savings": f"{len(collected_responses)}x vs individual critiques" if use_cheap_model else "N/A"
+                    }
+                }
+            return {"error": "No critique generated from the model"}
+
+        except Exception as e:
+            return {"error": f"Consolidated critique failed: {str(e)}"}
+
+    def _build_consolidated_prompt(self, responses: List[Dict[str, str]], mode: str, context: str) -> str:
+        """Build a consolidated critique prompt for multiple analyst responses."""
+        prompt_parts = [
+            "# Consolidated Multi-Analyst Critique Task",
+            "",
+            f"## Critique Mode: {mode.replace('_', ' ').title()}",
+            ""
+        ]
+        
+        if context:
+            prompt_parts.extend([
+                "## Company/Scenario Context:",
+                context,
+                ""
+            ])
+        
+        prompt_parts.extend([
+            "## Analyst Reports to Review:",
+            ""
+        ])
+        
+        for i, resp in enumerate(responses, 1):
+            agent_name = resp["agent"].replace("_", " ").title()
+            prompt_parts.extend([
+                f"### {i}. {agent_name} Report:",
+                "```",
+                resp["response"],
+                "```",
+                ""
+            ])
+        
+        # Mode-specific instructions
+        if mode == "cross_analysis":
+            prompt_parts.extend([
+                "## Task: Cross-Analysis Critique",
+                "Analyze all reports together and provide:",
+                "",
+                "1. **Consistency Check**: Do the analysts agree on key metrics and conclusions?",
+                "2. **Contradiction Detection**: Identify any conflicting assessments or recommendations",
+                "3. **Gaps Analysis**: What critical aspects are missing across all reports?",
+                "4. **Synthesis Opportunities**: Where can insights be combined for stronger conclusions?",
+                "5. **Priority Issues**: Rank the most critical findings across all analyses",
+                "6. **Unified Recommendations**: Consolidated action items based on all inputs",
+                ""
+            ])
+        elif mode == "conflicts_only":
+            prompt_parts.extend([
+                "## Task: Conflict Identification",
+                "Focus ONLY on identifying contradictions and inconsistencies:",
+                "",
+                "1. **Direct Contradictions**: Where do analysts disagree on facts or assessments?",
+                "2. **Implicit Conflicts**: Recommendations that contradict each other",
+                "3. **Severity Rating**: How critical is each conflict?",
+                "4. **Resolution Guidance**: How should conflicts be resolved?",
+                ""
+            ])
+        else:  # comprehensive
+            prompt_parts.extend([
+                "## Task: Comprehensive Review",
+                "Provide a thorough critique covering:",
+                "",
+                "1. **Individual Report Quality**: Assess each analyst's work",
+                "2. **Cross-Validation**: Verify claims across reports",
+                "3. **Completeness**: Are all financial aspects adequately covered?",
+                "4. **Risk Blind Spots**: Risks mentioned by some but not all analysts",
+                "5. **Evidence Quality**: Strength of supporting data/rationale",
+                "6. **Actionability**: How implementable are the recommendations?",
+                "7. **Holistic View**: Integrated assessment from all perspectives",
+                ""
+            ])
+        
+        prompt_parts.extend([
+            "## Output Format:",
+            "Provide structured feedback that can be used to improve analyses or inform decision-making.",
+            ""
+        ])
+
+        return "\n".join(prompt_parts)
+
+
+@dataclass
+class CriticAgentTool:
+    """AI agent that critiques other agents' responses to help them improve their analysis."""
+    
+    config: Dict[str, Any]
+    memory_tool: Optional['MemoryStoreTool'] = None
+    all_tools: Optional[Dict[str, Any]] = None  # Reference to all available tools
+
+    def __post_init__(self) -> None:
+        self.name: str = str(self.config.get("name") or "")
+        if not self.name:
+            raise ValueError("Local tool config missing required field 'name'")
+
+        self.description: str = str(
+            self.config.get("description")
+            or "AI agent that critiques and evaluates responses from other analyst agents."
+        )
+
+        self.api_base: str = "local"
+        self.input_schema: Dict[str, Any] = self.config.get("input_schema") or {}
+
+    def handle(self, session_id: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        args = arguments or {}
+        response_key = args.get("response_key")
+        response_text = args.get("response_text")
+        agent_type = args.get("agent_type", "general")
+        criteria = args.get("criteria", ["completeness", "accuracy", "depth", "actionability", "evidence"])
+        context = args.get("context", "")
+        api_key = args.get("api_key") or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPEN_ROUTER_API_KEY")
+        save_to = args.get("save_to")
+        model = args.get("model", "deepseek/deepseek-r1-0528:free")
+        timeout = args.get("timeout", 60)
+
+        if not api_key:
+            return {"error": "OpenRouter API key required. Set OPENROUTER_API_KEY or OPEN_ROUTER_API_KEY environment variable."}
+
+        # Get the response to critique
+        response_content = None
+        if response_text:
+            response_content = response_text
+        elif response_key and self.memory_tool:
+            get_result = self.memory_tool.handle(session_id, {"action": "get", "key": response_key})
+            if "error" in get_result:
+                return {"error": f"Could not find response with key '{response_key}': {get_result.get('error')}"}
+            
+            response_value = get_result.get("content", {}).get("value")
+            if isinstance(response_value, dict):
+                # Extract the analysis/hypothesis from the response object
+                response_content = response_value.get("analysis") or response_value.get("hypothesis") or str(response_value)
+            else:
+                response_content = str(response_value)
+        else:
+            # Auto-discover recent analyst outputs
+            if not self.memory_tool:
+                return {"error": "No response provided and MemoryStoreTool not configured"}
+            
+            keys_result = self.memory_tool.handle(session_id, {"action": "keys"})
+            if "error" in keys_result:
+                return {"error": "Could not retrieve memory keys to auto-discover response"}
+            
+            all_variables = keys_result.get("content", {}).get("keys", [])
+            # Look for analyst outputs (typically have _analysis or _hypothesis suffixes)
+            analyst_vars = [k for k in all_variables if any(x in k.lower() for x in ["analyst", "hypothesis", "analysis"])]
+            
+            if not analyst_vars:
+                return {
+                    "error": "No response provided. Please specify 'response_key' or 'response_text'.",
+                    "available_variables": all_variables
+                }
+            
+            # Use the first analyst variable found
+            response_key = analyst_vars[0]
+            get_result = self.memory_tool.handle(session_id, {"action": "get", "key": response_key})
+            response_value = get_result.get("content", {}).get("value")
+            if isinstance(response_value, dict):
+                response_content = response_value.get("analysis") or response_value.get("hypothesis") or str(response_value)
+            else:
+                response_content = str(response_value)
+
+        if not response_content:
+            return {"error": "No response content found to critique"}
+
+        # Build the critique prompt
+        prompt = self._build_prompt(response_content, agent_type, criteria, context)
+
+        # Call OpenRouter API
+        try:
+            response = requests.post(
+                url="https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://github.com/xendex-mcp-server",
+                    "X-Title": "Xendex MCP Critic Agent",
+                },
+                json={
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a rigorous critic and peer reviewer for financial analysis. Your role is to evaluate analytical responses for quality, completeness, logical consistency, and actionability. Provide constructive feedback that helps analysts improve their work."
+                        },
+                        {"role": "user", "content": prompt}
+                    ]
+                },
+                timeout=timeout
+            )
+            response.raise_for_status()
+            result = response.json()
+
+            if "choices" in result and len(result["choices"]) > 0:
+                choice = result["choices"][0]
+                message = choice.get("message", {})
+                raw_content = message.get("content", "")
+                
+                # OpenRouter separates reasoning from content for DeepSeek R1
+                # If content is empty, check the reasoning field
+                if not raw_content:
+                    reasoning = message.get("reasoning", "")
+                    if reasoning:
+                        print(f"DEBUG critic_agent: Content empty, using reasoning field (length: {len(reasoning)})")
+                        raw_content = reasoning
+                
+                critique = _extract_content_from_response(raw_content)
+                
+                # Debug: Log if critique is empty
+                if not critique:
+                    print(f"WARNING: Empty critique extracted from critic agent response")
+                    print(f"Raw content length: {len(raw_content)})")
+                
+                critique_obj = {
+                    "critic": "critic_agent",
+                    "critique": critique,
+                    "target_response_key": response_key,
+                    "agent_type": agent_type,
+                    "criteria": criteria,
+                    "context": context,
+                    "model": model,
+                    "timestamp": result.get("created"),
+                    "usage": result.get("usage", {})
+                }
+                
+                # Save the critique if requested
+                if save_to and self.memory_tool:
+                    self.memory_tool.handle(session_id, {
+                        "action": "set",
+                        "key": save_to,
+                        "value": critique_obj
+                    })
+
+                return {
+                    "content": {
+                        "critique": critique,
+                        "target_response_key": response_key,
+                        "agent_type": agent_type,
+                        "criteria": criteria,
+                        "model_used": model,
+                        "saved_to": save_to if save_to else None,
+                        "usage": result.get("usage", {})
+                    }
+                }
+            return {"error": "No critique generated from the model"}
+
+        except Exception as e:
+            return {"error": f"Critique failed: {str(e)}"}
+
+    def _build_prompt(self, response_content: str, agent_type: str, criteria: List[str], context: str) -> str:
+        """Build the critique prompt."""
+        prompt_parts = [
+            "# Response Critique Task",
+            "",
+            f"## Agent Type: {agent_type}",
+            ""
+        ]
+        
+        if context:
+            prompt_parts.extend([
+                "## Context:",
+                context,
+                ""
+            ])
+        
+        prompt_parts.extend([
+            "## Response to Critique:",
+            "```",
+            response_content,
+            "```",
+            "",
+            "## Evaluation Criteria:",
+        ])
+        
+        for criterion in criteria:
+            prompt_parts.append(f"- {criterion.replace('_', ' ').title()}")
+        
+        prompt_parts.extend([
+            "",
+            "## Task:",
+            "Provide a comprehensive critique of the above response. Your critique should include:",
+            "",
+            "1. **Strengths**: What the response does well",
+            "2. **Weaknesses**: Gaps, logical flaws, or unsupported claims",
+            "3. **Missing Elements**: What critical aspects are not addressed",
+            "4. **Specific Improvements**: Concrete suggestions for enhancement",
+            "5. **Risk Assessment**: Potential issues if recommendations are followed",
+            "6. **Overall Rating**: Score from 1-10 with justification",
+            "",
+            "Be constructive but rigorous. Identify specific areas for improvement and provide actionable feedback.",
+            ""
         ])
 
         return "\n".join(prompt_parts)

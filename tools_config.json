@@ -1,41 +1,6 @@
 {
   "tools": [
     {
-      "name": "httpbin_get_ip",
-      "description": "GET https://httpbin.org/ip to show the caller IP.",
-      "api_base": "https://httpbin.org",
-      "endpoint": "/ip",
-      "method": "GET",
-      "input_schema": {
-        "type": "object",
-        "properties": {},
-        "additionalProperties": true
-      }
-    },
-    {
-      "name": "httpbin_post_echo",
-      "description": "POST https://httpbin.org/post and echo back the JSON you send.",
-      "api_base": "https://httpbin.org",
-      "endpoint": "/post",
-      "method": "POST",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "message": {
-            "type": "string",
-            "description": "Any message to echo"
-          },
-          "meta": {
-            "type": "object",
-            "description": "Optional metadata",
-            "additionalProperties": true
-          }
-        },
-        "required": ["message"],
-        "additionalProperties": true
-      }
-    },
-    {
       "name": "memory_store",
       "description": "Session-scoped in-memory variables/lists (set/get/append/etc).",
       "api_base": "local",
@@ -187,6 +152,16 @@
             "type": "number",
             "description": "API request timeout in seconds (default: 120). Increase if using reasoning models that need more time.",
             "default": 120
+          },
+          "enable_self_critique": {
+            "type": "boolean",
+            "description": "Enable automatic self-critique to iteratively improve the analysis (default: false)",
+            "default": false
+          },
+          "max_iterations": {
+            "type": "number",
+            "description": "Maximum number of critique-refinement iterations when self-critique is enabled (default: 2)",
+            "default": 2
           }
         },
         "required": [],
@@ -223,8 +198,18 @@
           },
           "timeout": {
             "type": "number",
-            "description": "API request timeout in seconds (default: 25)",
-            "default": 25
+            "description": "API request timeout in seconds (default: 120)",
+            "default": 120
+          },
+          "enable_self_critique": {
+            "type": "boolean",
+            "description": "Enable automatic self-critique to iteratively improve the analysis (default: false)",
+            "default": false
+          },
+          "max_iterations": {
+            "type": "number",
+            "description": "Maximum number of critique-refinement iterations when self-critique is enabled (default: 2)",
+            "default": 2
           }
         },
         "required": [],
@@ -262,8 +247,18 @@
           },
           "timeout": {
             "type": "number",
-            "description": "API request timeout in seconds (default: 25)",
-            "default": 25
+            "description": "API request timeout in seconds (default: 120)",
+            "default": 120
+          },
+          "enable_self_critique": {
+            "type": "boolean",
+            "description": "Enable automatic self-critique to iteratively improve the analysis (default: false)",
+            "default": false
+          },
+          "max_iterations": {
+            "type": "number",
+            "description": "Maximum number of critique-refinement iterations when self-critique is enabled (default: 2)",
+            "default": 2
           }
         },
         "required": [],
@@ -301,12 +296,144 @@
           },
           "timeout": {
             "type": "number",
-            "description": "API request timeout in seconds (default: 25)",
-            "default": 25
+            "description": "API request timeout in seconds (default: 120)",
+            "default": 120
+          },
+          "enable_self_critique": {
+            "type": "boolean",
+            "description": "Enable automatic self-critique to iteratively improve the analysis (default: false)",
+            "default": false
+          },
+          "max_iterations": {
+            "type": "number",
+            "description": "Maximum number of critique-refinement iterations when self-critique is enabled (default: 2)",
+            "default": 2
           }
         },
         "required": [],
         "additionalProperties": false
-      }    }
+      }    },
+    {
+      "name": "consolidated_analyst_critique",
+      "description": "Batch critique multiple analyst responses together for cost efficiency. Analyzes all analyst outputs (debt, liquidity, QoE, asset quality) simultaneously to identify conflicts, gaps, and provide consolidated feedback.",
+      "api_base": "local",
+      "local_tool": "consolidated_analyst_critique",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "analyst_responses": {
+            "type": "array",
+            "description": "Array of analyst response objects with agent type and response content",
+            "items": {
+              "type": "object",
+              "properties": {
+                "agent": {
+                  "type": "string",
+                  "description": "Type of analyst (debt_analyst, liquidity_analyst, qoe_analyst, asset_quality_analyst)",
+                  "enum": ["debt_analyst", "liquidity_analyst", "qoe_analyst", "asset_quality_analyst"]
+                },
+                "response": {
+                  "type": "string",
+                  "description": "The analysis response text from the analyst"
+                },
+                "response_key": {
+                  "type": "string",
+                  "description": "Optional memory key where response is stored"
+                }
+              },
+              "required": ["agent", "response"]
+            }
+          },
+          "critique_mode": {
+            "type": "string",
+            "description": "Mode of critique: cross_analysis (check consistency across analysts), conflicts_only (identify contradictions), comprehensive (detailed review)",
+            "enum": ["cross_analysis", "conflicts_only", "comprehensive"],
+            "default": "cross_analysis"
+          },
+          "use_cheap_model": {
+            "type": "boolean",
+            "description": "Use cost-efficient model (gpt-4o-mini) instead of reasoning model for critique (default: true)",
+            "default": true
+          },
+          "model": {
+            "type": "string",
+            "description": "Override model selection (default: else deepseek/deepseek-r1-0528:free)"
+          },
+          "context": {
+            "type": "string",
+            "description": "Additional context about the company or analysis scenario"
+          },
+          "api_key": {
+            "type": "string",
+            "description": "OpenRouter API key (optional, can be set via environment variable)"
+          },
+          "save_to": {
+            "type": "string",
+            "description": "Optional key to save the consolidated critique to in memory store"
+          },
+          "timeout": {
+            "type": "number",
+            "description": "API request timeout in seconds (default: 60)",
+            "default": 60
+          }
+        },
+        "required": ["analyst_responses"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "critic_agent",
+      "description": "AI agent that critically evaluates and provides feedback on other agents' responses, hypotheses, and analyses. Identifies weaknesses, logical gaps, unsupported claims, and suggests improvements. Can be used iteratively to refine agent outputs.",
+      "api_base": "local",
+      "local_tool": "critic_agent",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "response_to_critique": {
+            "type": "string",
+            "description": "The response, hypothesis, or analysis to critique. Can be text or a memory key containing the response."
+          },
+          "blackboard_key": {
+            "type": "string",
+            "description": "Optional: The key in memory store containing the original facts/data that the response was based on. Helps provide context for critique."
+          },
+          "critique_focus": {
+            "type": "string",
+            "description": "Optional: Specific aspects to focus on (e.g., 'logical consistency', 'evidence quality', 'completeness', 'assumptions', 'risk assessment')",
+            "enum": ["logical_consistency", "evidence_quality", "completeness", "assumptions", "risk_assessment", "methodology", "conclusions", "all"]
+          },
+          "context": {
+            "type": "string",
+            "description": "Additional context about what type of analysis this is (e.g., 'debt analysis', 'liquidity analysis', 'QoE analysis')"
+          },
+          "api_key": {
+            "type": "string",
+            "description": "OpenRouter API key (optional, can be set via environment variable)"
+          },
+          "save_to": {
+            "type": "string",
+            "description": "Optional key to save the critique results to in memory store"
+          },
+          "model": {
+            "type": "string",
+            "description": "Model to use (default: deepseek/deepseek-r1-0528:free)",
+            "default": "deepseek/deepseek-r1-0528:free"
+          },
+          "timeout": {
+            "type": "number",
+            "description": "API request timeout in seconds (default: 120)",
+            "default": 120
+          },
+          "severity_threshold": {
+            "type": "string",
+            "description": "Minimum severity level to report (default: 'low')",
+            "enum": ["critical", "high", "medium", "low"],
+            "default": "low"
+          }
+        },
+        "required": ["response_to_critique"],
+        "additionalProperties": false
+      }
+    }
   ]
 }
