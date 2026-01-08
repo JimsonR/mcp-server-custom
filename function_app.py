@@ -88,7 +88,14 @@ def mcp(req: func.HttpRequest) -> func.HttpResponse:
 	server = get_mcp_server()
 
 	try:
-		response_payload = server.handle_request(request_body, session_id)
+		# Handle batch requests (JSON-RPC 2.0 array) or single requests
+		if isinstance(request_body, list):
+			# Batch request - execute concurrently
+			response_payload = server.handle_batch_request(request_body, session_id)
+		else:
+			# Single request
+			response_payload = server.handle_request(request_body, session_id)
+		
 		return func.HttpResponse(
 			body=json.dumps(response_payload),
 			status_code=200,

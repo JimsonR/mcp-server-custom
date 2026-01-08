@@ -9,6 +9,7 @@ import sys
 import json
 import threading
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import click
 
 from typing import Dict, Any, List
@@ -124,7 +125,10 @@ class MCPServer:
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {
-                    "tools": {"listChanged": True},
+                    "tools": {
+                        "listChanged": True,
+                        "concurrency": {"maxConcurrency": 10}
+                    },
                     "resources": {"subscribe": True, "listChanged": True},
                 },
                 "serverInfo": {
@@ -332,6 +336,58 @@ class MCPServer:
                 },
             }
 
+    def handle_batch_request(
+        self,
+        requests: List[Dict[str, Any]],
+        session_id: str,
+        max_workers: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Handle batch of JSON-RPC requests concurrently.
+        
+        Executes multiple requests in parallel using ThreadPoolExecutor.
+        Returns responses in completion order (not request order).
+        
+        Args:
+            requests: List of JSON-RPC request objects
+            session_id: Session identifier for the requests
+            max_workers: Maximum number of concurrent workers (default: 10)
+            
+        Returns:
+            List of JSON-RPC response objects
+        """
+        if not requests:
+            return []
+        
+        # Limit max_workers to number of requests
+        effective_workers = min(max_workers, len(requests))
+        responses = []
+        
+        logger.info(f"Executing batch of {len(requests)} requests with {effective_workers} workers")
+        
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            # Submit all requests for concurrent execution
+            future_to_request = {
+                executor.submit(self.handle_request, req, session_id): req
+                for req in requests
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_request):
+                req = future_to_request[future]
+                try:
+                    response = future.result()
+                    responses.append(response)
+                except Exception as e:
+                    logger.error(f"Error processing batch request {req.get('id')}: {e}")
+                    responses.append({
+                        "jsonrpc": "2.0",
+                        "id": req.get("id"),
+                        "error": {"code": -32000, "message": str(e)}
+                    })
+        
+        logger.info(f"Batch execution completed: {len(responses)} responses")
+        return responses
+
 
 # ------------------------------------------------------------------
 # HTTP Transport
@@ -352,7 +408,13 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
             if session_id not in server.sessions:
                 server.create_session(session_id)
 
-            response = server.handle_request(data, session_id)
+            # Handle batch requests (JSON-RPC 2.0 array) or single requests
+            if isinstance(data, list):
+                # Batch request - execute concurrently
+                response = server.handle_batch_request(data, session_id)
+            else:
+                # Single request
+                response = server.handle_request(data, session_id)
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
