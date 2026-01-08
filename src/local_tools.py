@@ -4,14 +4,165 @@ import json
 import os
 import re
 import requests
+import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
+from openai import OpenAI
+
 load_dotenv()
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 # Session-scoped in-memory store.
 # Persists for the lifetime of the Python process.
 _SESSION_STATE: Dict[str, Dict[str, Any]] = {}
+
+# Default timeout and token settings for analyst agents
+DEFAULT_TIMEOUT = 120  # Increased from 25 for reasoning models
+DEFAULT_MAX_TOKENS = 4000  # Ensure enough tokens for full responses
+
+
+def _get_openai_client(api_key: str) -> OpenAI:
+    """Create OpenAI client configured for OpenRouter."""
+    return OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+    )
+
+
+def _make_llm_call(
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    timeout: int = DEFAULT_TIMEOUT,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    agent_type: str = "unknown"
+) -> Tuple[str, Dict[str, Any], Optional[str]]:
+    """
+    Make LLM call using OpenAI SDK with proper fallback handling.
+    
+    Returns:
+        Tuple of (content, usage_dict, error_message)
+        - content: The extracted analysis content
+        - usage_dict: Token usage information
+        - error_message: None if successful, error string if failed
+    """
+    logger.info(f"Starting {agent_type} LLM call with model {model}")
+    
+    try:
+        client = _get_openai_client(api_key)
+        
+        completion = client.chat.completions.create(
+            extra_headers={
+                "HTTP-Referer": "https://github.com/xendex-mcp-server",
+                "X-Title": f"Xendex MCP {agent_type.replace('_', ' ').title()}",
+            },
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            timeout=timeout,
+            max_tokens=max_tokens,
+        )
+        
+        # Extract content from response
+        choice = completion.choices[0] if completion.choices else None
+        if not choice:
+            logger.error(f"{agent_type}: No choices in response")
+            return "", {}, f"[ERROR] {agent_type} agent received no response choices from model"
+        
+        message = choice.message
+        raw_content = message.content or ""
+        
+        logger.info(f"{agent_type}: Raw content length: {len(raw_content)}")
+        
+        # OpenRouter may put reasoning in a separate field for DeepSeek R1
+        # Check if content is empty but reasoning exists
+        reasoning = getattr(message, 'reasoning', None) or ""
+        if not raw_content and reasoning:
+            logger.info(f"{agent_type}: Content empty, using reasoning field (length: {len(reasoning)})")
+            raw_content = reasoning
+        
+        # Extract actual content from response (handles <think> tags)
+        analysis = _extract_content_from_response(raw_content)
+        
+        # CRITICAL FALLBACK: If extraction returns empty but we have content, use raw
+        if not analysis and raw_content:
+            logger.warning(f"CRITICAL: Extraction failed for {agent_type}, using raw content")
+            logger.debug(f"Raw content first 500 chars: {raw_content[:500]}")
+            analysis = raw_content
+        
+        # Final fallback: return warning if still empty
+        if not analysis:
+            logger.error(f"{agent_type}: Empty analysis AND empty raw content")
+            return (
+                f"[WARNING] Unable to generate {agent_type} analysis. The model returned an empty response. This may be due to timeout or insufficient data.",
+                {},
+                None  # Not an error per se, just empty - return structured warning
+            )
+        
+        # Get usage info
+        usage = {}
+        if completion.usage:
+            usage = {
+                "prompt_tokens": completion.usage.prompt_tokens,
+                "completion_tokens": completion.usage.completion_tokens,
+                "total_tokens": completion.usage.total_tokens,
+            }
+        
+        logger.info(f"{agent_type}: Successfully extracted analysis (length: {len(analysis)})")
+        return analysis, usage, None
+        
+    except TimeoutError as e:
+        logger.error(f"{agent_type} timeout: {e}")
+        return (
+            f"[ERROR] {agent_type} agent timed out after {timeout} seconds. Please try again or increase timeout.",
+            {},
+            str(e)
+        )
+    except Exception as e:
+        logger.error(f"{agent_type} error: {e}")
+        return (
+            f"[ERROR] {agent_type} agent failed: {str(e)}",
+            {},
+            str(e)
+        )
+
+
+def _validate_analysis_response(
+    analysis: str,
+    agent_type: str,
+    error: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Validate and structure an analysis response.
+    Ensures a response always has usable content.
+    """
+    if error:
+        return {
+            "analysis": analysis if analysis else f"[ERROR] {agent_type} agent failed: {error}",
+            "success": False,
+            "error": error
+        }
+    
+    if not analysis or not analysis.strip():
+        return {
+            "analysis": f"[WARNING] Unable to generate {agent_type} analysis. Insufficient data or empty response.",
+            "success": False,
+            "error": "Empty analysis"
+        }
+    
+    return {
+        "analysis": analysis,
+        "success": True,
+        "error": None
+    }
+
+
 
 
 def _extract_content_from_response(content: str) -> str:
@@ -1157,28 +1308,50 @@ class LiquidityAnalystTool:
         api_key = args.get("api_key") or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPEN_ROUTER_API_KEY")
         save_to = args.get("save_to")
         model = args.get("model", "deepseek/deepseek-r1-0528:free")
-        timeout = args.get("timeout", 25)
+        timeout = args.get("timeout", DEFAULT_TIMEOUT)  # Use increased default timeout
+
+        logger.info(f"Starting liquidity analyst for session {session_id}")
 
         if not api_key:
-            return {"error": "OpenRouter API key required. Set OPENROUTER_API_KEY or OPEN_ROUTER_API_KEY environment variable."}
+            return {
+                "error": "OpenRouter API key required. Set OPENROUTER_API_KEY or OPEN_ROUTER_API_KEY environment variable.",
+                "content": {
+                    "analysis": "[ERROR] Liquidity analyst failed: API key not configured",
+                    "success": False
+                }
+            }
 
         if not self.memory_tool:
-            return {"error": "MemoryStoreTool not configured for this analyst"}
+            return {
+                "error": "MemoryStoreTool not configured for this analyst",
+                "content": {
+                    "analysis": "[ERROR] Liquidity analyst failed: Memory tool not configured",
+                    "success": False
+                }
+            }
 
         keys_result = self.memory_tool.handle(session_id, {"action": "keys"})
         if "error" in keys_result:
             return keys_result
         all_variables = keys_result.get("content", {}).get("keys", [])
         
+        logger.info(f"Liquidity analyst: Available variables: {all_variables}")
+        
         if not all_variables:
-            return {"error": "No variables found in memory store. Please create variables first."}
+            return {
+                "error": "No variables found in memory store. Please create variables first.",
+                "content": {
+                    "analysis": "[WARNING] Liquidity analyst: No variables found in memory store",
+                    "success": False
+                }
+            }
         
         # Check if explicitly provided blackboard_key exists and has data
         original_blackboard_key = blackboard_key
         if blackboard_key:
             get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
             if "error" in get_result or get_result.get("content", {}).get("value") is None:
-                print(f"Warning: Blackboard key '{blackboard_key}' not found or is None. Attempting auto-discovery...")
+                logger.warning(f"Blackboard key '{blackboard_key}' not found or is None. Attempting auto-discovery...")
                 blackboard_key = None
         
         # Auto-discover blackboard if not specified or if explicit key failed
@@ -1192,14 +1365,14 @@ class LiquidityAnalystTool:
                         candidates.append(k)
             if candidates:
                 blackboard_key = candidates[0]
-                print(f"Auto-discovered blackboard variable: {blackboard_key}")
+                logger.info(f"Auto-discovered blackboard variable: {blackboard_key}")
             else:
                 for var_name in all_variables:
                     if "blackboard" in var_name.lower():
                         get_result = self.memory_tool.handle(session_id, {"action": "get", "key": var_name})
                         if "error" not in get_result and get_result.get("content", {}).get("value") is not None:
                             blackboard_key = var_name
-                            print(f"Found blackboard variable: {blackboard_key}")
+                            logger.info(f"Found blackboard variable: {blackboard_key}")
                             break
                 if not blackboard_key:
                     error_msg = f"No blackboard variable found. Available: {all_variables}"
@@ -1207,19 +1380,34 @@ class LiquidityAnalystTool:
                         error_msg = f"Blackboard key '{original_blackboard_key}' not found or is None. " + error_msg
                     return {
                         "error": error_msg,
-                        "available_variables": all_variables
+                        "available_variables": all_variables,
+                        "content": {
+                            "analysis": f"[ERROR] Liquidity analyst: {error_msg}",
+                            "success": False
+                        }
                     }
         
         # Get blackboard object (we know it exists now)
         get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
         if "error" in get_result:
-            return {"error": f"Blackboard key '{blackboard_key}' not found.", "available_variables": all_variables}
+            return {
+                "error": f"Blackboard key '{blackboard_key}' not found.", 
+                "available_variables": all_variables,
+                "content": {
+                    "analysis": f"[ERROR] Liquidity analyst: Blackboard key '{blackboard_key}' not found",
+                    "success": False
+                }
+            }
 
         blackboard_obj = get_result.get("content", {}).get("value")
         if blackboard_obj is None:
             return {
                 "error": f"Blackboard key '{blackboard_key}' is None. Please ensure the blackboard contains data.",
-                "available_variables": all_variables
+                "available_variables": all_variables,
+                "content": {
+                    "analysis": f"[ERROR] Liquidity analyst: Blackboard '{blackboard_key}' is empty",
+                    "success": False
+                }
             }
         
         # Extract facts and metadata
@@ -1228,7 +1416,11 @@ class LiquidityAnalystTool:
             if facts is None:
                 return {
                     "error": f"Blackboard '{blackboard_key}' facts property is None. Please ensure facts contains data.",
-                    "available_variables": all_variables
+                    "available_variables": all_variables,
+                    "content": {
+                        "analysis": f"[ERROR] Liquidity analyst: Facts in blackboard '{blackboard_key}' is None",
+                        "success": False
+                    }
                 }
             metadata = {k: v for k, v in blackboard_obj.items() if k != "facts"}
         else:
@@ -1236,105 +1428,73 @@ class LiquidityAnalystTool:
             metadata = {}
 
         prompt = self._build_prompt(facts, context, metadata, all_variables)
+        
+        system_prompt = """You are a liquidity analyst AI agent. Analyze cash flow, working capital, current ratios, quick ratios, and liquidity positions. Identify liquidity risks and opportunities.
 
-        try:
-            response = requests.post(
-                url="https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://github.com/xendex-mcp-server",
-                    "X-Title": "Xendex MCP Liquidity Analyst",
-                },
-                json={
-                    "model": model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": "You are a liquidity analyst AI agent. Analyze cash flow, working capital, current ratios, quick ratios, and liquidity positions. Identify liquidity risks and opportunities.\n\nIMPORTANT: After your reasoning process, provide your complete final analysis. Put your analysis in the main response, not just in thinking tags."
-                        },
-                        {"role": "user", "content": prompt}
-                    ]
-                },
-                timeout=timeout
-            )
-            response.raise_for_status()
-            result = response.json()
+IMPORTANT: After your reasoning process, provide your complete final analysis. Put your analysis in the main response, not just in thinking tags."""
 
-            if "choices" in result and len(result["choices"]) > 0:
-                # Debug: Log the entire choice structure
-                choice = result["choices"][0]
-                print(f"DEBUG liquidity: Full choice keys: {choice.keys()}")
-                message = choice.get("message", {})
-                print(f"DEBUG liquidity: Message keys: {message.keys()}")
-                
-                raw_content = message.get("content", "")
-                print(f"DEBUG liquidity: Raw content type: {type(raw_content)}, length: {len(raw_content) if raw_content else 0}")
-                
-                # OpenRouter separates reasoning from content for DeepSeek R1
-                # If content is empty, check the reasoning field
-                if not raw_content:
-                    reasoning = message.get("reasoning", "")
-                    if reasoning:
-                        print(f"DEBUG liquidity: Content empty, using reasoning field (length: {len(reasoning)})")
-                        raw_content = reasoning
-                
-                analysis = _extract_content_from_response(raw_content)
-                
-                # CRITICAL FIX: If extraction returns empty but we have content, use raw
-                if not analysis and raw_content:
-                    print(f"CRITICAL: Extraction failed for liquidity analyst, using raw content")
-                    print(f"Raw content length: {len(raw_content)}")
-                    print(f"First 1000 chars: {raw_content[:1000]}")
-                    # Use the raw content as-is (includes thinking tags, but better than nothing)
-                    analysis = raw_content
-                elif not analysis:
-                    print(f"ERROR: Empty analysis AND empty raw content from liquidity analyst")
-                
-                hypothesis_obj = {
-                    "analyst": "liquidity_analyst",
-                    "analysis": analysis,
-                    "context": context,
-                    "model": model,
-                    "timestamp": result.get("created"),
-                    "usage": result.get("usage", {})
-                }
-                
-                # Append to blackboard hypotheses using tool call
-                added_to_blackboard = False
-                if isinstance(blackboard_obj, dict) and "hypotheses" in blackboard_obj and self.mutate_tool:
-                    append_result = self.mutate_tool.handle(session_id, {
-                        "action": "nested_list_append",
-                        "key": blackboard_key,
-                        "path": ["hypotheses"],
-                        "value": hypothesis_obj
-                    })
-                    if "error" not in append_result:
-                        added_to_blackboard = True
-                
-                if save_to:
-                    self.memory_tool.handle(session_id, {
-                        "action": "set",
-                        "key": save_to,
-                        "value": hypothesis_obj
-                    })
+        # Use the new helper function for LLM call with proper fallback handling
+        analysis, usage, error = _make_llm_call(
+            api_key=api_key,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=prompt,
+            timeout=timeout,
+            max_tokens=DEFAULT_MAX_TOKENS,
+            agent_type="liquidity_analyst"
+        )
+        
+        # Validate and structure the response
+        validated = _validate_analysis_response(analysis, "liquidity_analyst", error)
+        
+        hypothesis_obj = {
+            "analyst": "liquidity_analyst",
+            "analysis": validated["analysis"],
+            "context": context,
+            "model": model,
+            "usage": usage,
+            "success": validated["success"]
+        }
+        
+        # Append to blackboard hypotheses using tool call
+        added_to_blackboard = False
+        if isinstance(blackboard_obj, dict) and "hypotheses" in blackboard_obj and self.mutate_tool:
+            append_result = self.mutate_tool.handle(session_id, {
+                "action": "nested_list_append",
+                "key": blackboard_key,
+                "path": ["hypotheses"],
+                "value": hypothesis_obj
+            })
+            if "error" not in append_result:
+                added_to_blackboard = True
+        
+        if save_to:
+            self.memory_tool.handle(session_id, {
+                "action": "set",
+                "key": save_to,
+                "value": hypothesis_obj
+            })
 
-                return {
-                    "content": {
-                        "analysis": analysis,
-                        "facts_analyzed": facts,
-                        "blackboard_key": blackboard_key,
-                        "blackboard_metadata": metadata,
-                        "model_used": model,
-                        "saved_to": save_to,
-                        "added_to_blackboard": added_to_blackboard,
-                        "usage": result.get("usage", {})
-                    }
-                }
-            return {"error": "No response generated from the model"}
+        # Always return a structured response with content
+        result = {
+            "content": {
+                "analysis": validated["analysis"],
+                "facts_analyzed": facts,
+                "blackboard_key": blackboard_key,
+                "blackboard_metadata": metadata,
+                "model_used": model,
+                "saved_to": save_to,
+                "added_to_blackboard": added_to_blackboard,
+                "usage": usage,
+                "success": validated["success"]
+            }
+        }
+        
+        if error:
+            result["error"] = error
+            
+        return result
 
-        except Exception as e:
-            return {"error": f"Analysis failed: {str(e)}"}
 
     def _build_prompt(self, facts: Any, context: str, metadata: Dict[str, Any], all_variables: List[str]) -> str:
         """Build the analysis prompt from facts and context."""
@@ -1431,28 +1591,50 @@ class QOEAnalystTool:
         api_key = args.get("api_key") or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPEN_ROUTER_API_KEY")
         save_to = args.get("save_to")
         model = args.get("model", "deepseek/deepseek-r1-0528:free")
-        timeout = args.get("timeout", 25)
+        timeout = args.get("timeout", DEFAULT_TIMEOUT)  # Use increased default timeout
+
+        logger.info(f"Starting QoE analyst for session {session_id}")
 
         if not api_key:
-            return {"error": "OpenRouter API key required. Set OPENROUTER_API_KEY or OPEN_ROUTER_API_KEY environment variable."}
+            return {
+                "error": "OpenRouter API key required. Set OPENROUTER_API_KEY or OPEN_ROUTER_API_KEY environment variable.",
+                "content": {
+                    "analysis": "[ERROR] QoE analyst failed: API key not configured",
+                    "success": False
+                }
+            }
 
         if not self.memory_tool:
-            return {"error": "MemoryStoreTool not configured for this analyst"}
+            return {
+                "error": "MemoryStoreTool not configured for this analyst",
+                "content": {
+                    "analysis": "[ERROR] QoE analyst failed: Memory tool not configured",
+                    "success": False
+                }
+            }
 
         keys_result = self.memory_tool.handle(session_id, {"action": "keys"})
         if "error" in keys_result:
             return keys_result
         all_variables = keys_result.get("content", {}).get("keys", [])
         
+        logger.info(f"QoE analyst: Available variables: {all_variables}")
+        
         if not all_variables:
-            return {"error": "No variables found in memory store. Please create variables first."}
+            return {
+                "error": "No variables found in memory store. Please create variables first.",
+                "content": {
+                    "analysis": "[WARNING] QoE analyst: No variables found in memory store",
+                    "success": False
+                }
+            }
         
         # Check if explicitly provided blackboard_key exists and has data
         original_blackboard_key = blackboard_key
         if blackboard_key:
             get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
             if "error" in get_result or get_result.get("content", {}).get("value") is None:
-                print(f"Warning: Blackboard key '{blackboard_key}' not found or is None. Attempting auto-discovery...")
+                logger.warning(f"Blackboard key '{blackboard_key}' not found or is None. Attempting auto-discovery...")
                 blackboard_key = None
         
         # Auto-discover blackboard if not specified or if explicit key failed
@@ -1466,13 +1648,14 @@ class QOEAnalystTool:
                         candidates.append(k)
             if candidates:
                 blackboard_key = candidates[0]
-                print(f"Auto-discovered blackboard variable: {blackboard_key}")
+                logger.info(f"Auto-discovered blackboard variable: {blackboard_key}")
             else:
                 for var_name in all_variables:
                     if "blackboard" in var_name.lower():
                         get_result = self.memory_tool.handle(session_id, {"action": "get", "key": var_name})
                         if "error" not in get_result and get_result.get("content", {}).get("value") is not None:
-                            print(f"Found blackboard variable: {blackboard_key}")
+                            blackboard_key = var_name
+                            logger.info(f"Found blackboard variable: {blackboard_key}")
                             break
                 if not blackboard_key:
                     error_msg = f"No blackboard variable found. Available: {all_variables}"
@@ -1480,19 +1663,34 @@ class QOEAnalystTool:
                         error_msg = f"Blackboard key '{original_blackboard_key}' not found or is None. " + error_msg
                     return {
                         "error": error_msg,
-                        "available_variables": all_variables
+                        "available_variables": all_variables,
+                        "content": {
+                            "analysis": f"[ERROR] QoE analyst: {error_msg}",
+                            "success": False
+                        }
                     }
         
         # Get blackboard object (we know it exists now)
         get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
         if "error" in get_result:
-            return {"error": f"Blackboard key '{blackboard_key}' not found.", "available_variables": all_variables}
+            return {
+                "error": f"Blackboard key '{blackboard_key}' not found.", 
+                "available_variables": all_variables,
+                "content": {
+                    "analysis": f"[ERROR] QoE analyst: Blackboard key '{blackboard_key}' not found",
+                    "success": False
+                }
+            }
 
         blackboard_obj = get_result.get("content", {}).get("value")
         if blackboard_obj is None:
             return {
                 "error": f"Blackboard key '{blackboard_key}' is None. Please ensure the blackboard contains data.",
-                "available_variables": all_variables
+                "available_variables": all_variables,
+                "content": {
+                    "analysis": f"[ERROR] QoE analyst: Blackboard '{blackboard_key}' is empty",
+                    "success": False
+                }
             }
         
         # Extract facts and metadata
@@ -1501,7 +1699,11 @@ class QOEAnalystTool:
             if facts is None:
                 return {
                     "error": f"Blackboard '{blackboard_key}' facts property is None. Please ensure facts contains data.",
-                    "available_variables": all_variables
+                    "available_variables": all_variables,
+                    "content": {
+                        "analysis": f"[ERROR] QoE analyst: Facts in blackboard '{blackboard_key}' is None",
+                        "success": False
+                    }
                 }
             metadata = {k: v for k, v in blackboard_obj.items() if k != "facts"}
         else:
@@ -1509,84 +1711,73 @@ class QOEAnalystTool:
             metadata = {}
 
         prompt = self._build_prompt(facts, context, metadata, all_variables)
+        
+        system_prompt = """You are a Quality of Earnings (QoE) analyst AI agent. Evaluate earnings quality, sustainability, one-time items, accounting policies, revenue recognition, and potential earnings manipulation red flags.
 
-        try:
-            response = requests.post(
-                url="https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://github.com/xendex-mcp-server",
-                    "X-Title": "Xendex MCP QoE Analyst",
-                },
-                json={
-                    "model": model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": "You are a Quality of Earnings (QoE) analyst AI agent. Evaluate earnings quality, sustainability, one-time items, accounting policies, revenue recognition, and potential earnings manipulation red flags.\n\nIMPORTANT: After your reasoning process, provide your complete final analysis. Put your analysis in the main response, not just in thinking tags."
-                        },
-                        {"role": "user", "content": prompt}
-                    ]
-                },
-                timeout=timeout
-            )
-            response.raise_for_status()
-            result = response.json()
+IMPORTANT: After your reasoning process, provide your complete final analysis. Put your analysis in the main response, not just in thinking tags."""
 
-            if "choices" in result and len(result["choices"]) > 0:
-                raw_content = result["choices"][0]["message"]["content"]
-                analysis = _extract_content_from_response(raw_content)
-                
-                # Debug: Log if analysis is empty
-                if not analysis:
-                    print(f"WARNING: Empty analysis extracted from QoE analyst response")
-                    print(f"Raw content length: {len(raw_content)}")
-                
-                hypothesis_obj = {
-                    "analyst": "qoe_analyst",
-                    "analysis": analysis,
-                    "context": context,
-                    "model": model,
-                    "timestamp": result.get("created"),
-                    "usage": result.get("usage", {})
-                }
-                
-                # Append to blackboard hypotheses using tool call
-                added_to_blackboard = False
-                if isinstance(blackboard_obj, dict) and "hypotheses" in blackboard_obj and self.mutate_tool:
-                    append_result = self.mutate_tool.handle(session_id, {
-                        "action": "nested_list_append",
-                        "key": blackboard_key,
-                        "path": ["hypotheses"],
-                        "value": hypothesis_obj
-                    })
-                    if "error" not in append_result:
-                        added_to_blackboard = True
-                
-                if save_to:
-                    self.memory_tool.handle(session_id, {
-                        "action": "set",
-                        "key": save_to,
-                        "value": hypothesis_obj
-                    })
+        # Use the new helper function for LLM call with proper fallback handling
+        analysis, usage, error = _make_llm_call(
+            api_key=api_key,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=prompt,
+            timeout=timeout,
+            max_tokens=DEFAULT_MAX_TOKENS,
+            agent_type="qoe_analyst"
+        )
+        
+        # Validate and structure the response
+        validated = _validate_analysis_response(analysis, "qoe_analyst", error)
+        
+        hypothesis_obj = {
+            "analyst": "qoe_analyst",
+            "analysis": validated["analysis"],
+            "context": context,
+            "model": model,
+            "usage": usage,
+            "success": validated["success"]
+        }
+        
+        # Append to blackboard hypotheses using tool call
+        added_to_blackboard = False
+        if isinstance(blackboard_obj, dict) and "hypotheses" in blackboard_obj and self.mutate_tool:
+            append_result = self.mutate_tool.handle(session_id, {
+                "action": "nested_list_append",
+                "key": blackboard_key,
+                "path": ["hypotheses"],
+                "value": hypothesis_obj
+            })
+            if "error" not in append_result:
+                added_to_blackboard = True
+        
+        if save_to:
+            self.memory_tool.handle(session_id, {
+                "action": "set",
+                "key": save_to,
+                "value": hypothesis_obj
+            })
 
-                return {
-                    "content": {
-                        "analysis": analysis,
-                        "facts_analyzed": facts,
-                        "blackboard_key": blackboard_key,
-                        "blackboard_metadata": metadata,
-                        "model_used": model,
-                        "saved_to": save_to,
-                        "added_to_blackboard": added_to_blackboard,
-                        "usage": result.get("usage", {})
-                    }
-                }
-            return {"error": "No response generated from the model"}
+        # Always return a structured response with content
+        result = {
+            "content": {
+                "analysis": validated["analysis"],
+                "facts_analyzed": facts,
+                "blackboard_key": blackboard_key,
+                "blackboard_metadata": metadata,
+                "model_used": model,
+                "saved_to": save_to,
+                "added_to_blackboard": added_to_blackboard,
+                "usage": usage,
+                "success": validated["success"]
+            }
+        }
+        
+        if error:
+            result["error"] = error
+            
+        return result
 
-        except Exception as e:
-            return {"error": f"Analysis failed: {str(e)}"}
 
     def _build_prompt(self, facts: Any, context: str, metadata: Dict[str, Any], all_variables: List[str]) -> str:
         """Build the analysis prompt from facts and context."""
@@ -1684,28 +1875,50 @@ class AssetQualityAnalystTool:
         api_key = args.get("api_key") or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPEN_ROUTER_API_KEY")
         save_to = args.get("save_to")
         model = args.get("model", "deepseek/deepseek-r1-0528:free")
-        timeout = args.get("timeout", 25)
+        timeout = args.get("timeout", DEFAULT_TIMEOUT)  # Use increased default timeout
+
+        logger.info(f"Starting asset quality analyst for session {session_id}")
 
         if not api_key:
-            return {"error": "OpenRouter API key required. Set OPENROUTER_API_KEY or OPEN_ROUTER_API_KEY environment variable."}
+            return {
+                "error": "OpenRouter API key required. Set OPENROUTER_API_KEY or OPEN_ROUTER_API_KEY environment variable.",
+                "content": {
+                    "analysis": "[ERROR] Asset quality analyst failed: API key not configured",
+                    "success": False
+                }
+            }
 
         if not self.memory_tool:
-            return {"error": "MemoryStoreTool not configured for this analyst"}
+            return {
+                "error": "MemoryStoreTool not configured for this analyst",
+                "content": {
+                    "analysis": "[ERROR] Asset quality analyst failed: Memory tool not configured",
+                    "success": False
+                }
+            }
 
         keys_result = self.memory_tool.handle(session_id, {"action": "keys"})
         if "error" in keys_result:
             return keys_result
         all_variables = keys_result.get("content", {}).get("keys", [])
         
+        logger.info(f"Asset quality analyst: Available variables: {all_variables}")
+        
         if not all_variables:
-            return {"error": "No variables found in memory store. Please create variables first."}
+            return {
+                "error": "No variables found in memory store. Please create variables first.",
+                "content": {
+                    "analysis": "[WARNING] Asset quality analyst: No variables found in memory store",
+                    "success": False
+                }
+            }
         
         # Check if explicitly provided blackboard_key exists and has data
         original_blackboard_key = blackboard_key
         if blackboard_key:
             get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
             if "error" in get_result or get_result.get("content", {}).get("value") is None:
-                print(f"Warning: Blackboard key '{blackboard_key}' not found or is None. Attempting auto-discovery...")
+                logger.warning(f"Blackboard key '{blackboard_key}' not found or is None. Attempting auto-discovery...")
                 blackboard_key = None
         
         # Auto-discover blackboard if not specified or if explicit key failed
@@ -1719,14 +1932,14 @@ class AssetQualityAnalystTool:
                         candidates.append(k)
             if candidates:
                 blackboard_key = candidates[0]
-                print(f"Auto-discovered blackboard variable: {blackboard_key}")
+                logger.info(f"Auto-discovered blackboard variable: {blackboard_key}")
             else:
                 for var_name in all_variables:
                     if "blackboard" in var_name.lower():
                         get_result = self.memory_tool.handle(session_id, {"action": "get", "key": var_name})
                         if "error" not in get_result and get_result.get("content", {}).get("value") is not None:
                             blackboard_key = var_name
-                            print(f"Found blackboard variable: {blackboard_key}")
+                            logger.info(f"Found blackboard variable: {blackboard_key}")
                             break
                 if not blackboard_key:
                     error_msg = f"No blackboard variable found. Available: {all_variables}"
@@ -1734,18 +1947,33 @@ class AssetQualityAnalystTool:
                         error_msg = f"Blackboard key '{original_blackboard_key}' not found or is None. " + error_msg
                     return {
                         "error": error_msg,
-                        "available_variables": all_variables
+                        "available_variables": all_variables,
+                        "content": {
+                            "analysis": f"[ERROR] Asset quality analyst: {error_msg}",
+                            "success": False
+                        }
                     }
         
         get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
         if "error" in get_result:
-            return {"error": f"Blackboard key '{blackboard_key}' not found.", "available_variables": all_variables}
+            return {
+                "error": f"Blackboard key '{blackboard_key}' not found.", 
+                "available_variables": all_variables,
+                "content": {
+                    "analysis": f"[ERROR] Asset quality analyst: Blackboard key '{blackboard_key}' not found",
+                    "success": False
+                }
+            }
 
         blackboard_obj = get_result.get("content", {}).get("value")
         if blackboard_obj is None:
             return {
                 "error": f"Blackboard key '{blackboard_key}' is None. Please ensure the blackboard contains data.",
-                "available_variables": all_variables
+                "available_variables": all_variables,
+                "content": {
+                    "analysis": f"[ERROR] Asset quality analyst: Blackboard '{blackboard_key}' is empty",
+                    "success": False
+                }
             }
         
         # Extract facts and metadata
@@ -1754,7 +1982,11 @@ class AssetQualityAnalystTool:
             if facts is None:
                 return {
                     "error": f"Blackboard '{blackboard_key}' facts property is None. Please ensure facts contains data.",
-                    "available_variables": all_variables
+                    "available_variables": all_variables,
+                    "content": {
+                        "analysis": f"[ERROR] Asset quality analyst: Facts in blackboard '{blackboard_key}' is None",
+                        "success": False
+                    }
                 }
             metadata = {k: v for k, v in blackboard_obj.items() if k != "facts"}
         else:
@@ -1762,84 +1994,73 @@ class AssetQualityAnalystTool:
             metadata = {}
 
         prompt = self._build_prompt(facts, context, metadata, all_variables)
+        
+        system_prompt = """You are an asset quality analyst AI agent. Assess credit risk, loan quality, investment portfolio health, non-performing assets, provisions, and asset impairment risks.
 
-        try:
-            response = requests.post(
-                url="https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://github.com/xendex-mcp-server",
-                    "X-Title": "Xendex MCP Asset Quality Analyst",
-                },
-                json={
-                    "model": model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": "You are an asset quality analyst AI agent. Assess credit risk, loan quality, investment portfolio health, non-performing assets, provisions, and asset impairment risks.\n\nIMPORTANT: After your reasoning process, provide your complete final analysis. Put your analysis in the main response, not just in thinking tags."
-                        },
-                        {"role": "user", "content": prompt}
-                    ]
-                },
-                timeout=timeout
-            )
-            response.raise_for_status()
-            result = response.json()
+IMPORTANT: After your reasoning process, provide your complete final analysis. Put your analysis in the main response, not just in thinking tags."""
 
-            if "choices" in result and len(result["choices"]) > 0:
-                raw_content = result["choices"][0]["message"]["content"]
-                analysis = _extract_content_from_response(raw_content)
-                
-                # Debug: Log if analysis is empty
-                if not analysis:
-                    print(f"WARNING: Empty analysis extracted from asset quality analyst response")
-                    print(f"Raw content length: {len(raw_content)}")
-                
-                hypothesis_obj = {
-                    "analyst": "asset_quality_analyst",
-                    "analysis": analysis,
-                    "context": context,
-                    "model": model,
-                    "timestamp": result.get("created"),
-                    "usage": result.get("usage", {})
-                }
-                
-                # Append to blackboard hypotheses using tool call
-                added_to_blackboard = False
-                if isinstance(blackboard_obj, dict) and "hypotheses" in blackboard_obj and self.mutate_tool:
-                    append_result = self.mutate_tool.handle(session_id, {
-                        "action": "nested_list_append",
-                        "key": blackboard_key,
-                        "path": ["hypotheses"],
-                        "value": hypothesis_obj
-                    })
-                    if "error" not in append_result:
-                        added_to_blackboard = True
-                
-                if save_to:
-                    self.memory_tool.handle(session_id, {
-                        "action": "set",
-                        "key": save_to,
-                        "value": hypothesis_obj
-                    })
+        # Use the new helper function for LLM call with proper fallback handling
+        analysis, usage, error = _make_llm_call(
+            api_key=api_key,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=prompt,
+            timeout=timeout,
+            max_tokens=DEFAULT_MAX_TOKENS,
+            agent_type="asset_quality_analyst"
+        )
+        
+        # Validate and structure the response
+        validated = _validate_analysis_response(analysis, "asset_quality_analyst", error)
+        
+        hypothesis_obj = {
+            "analyst": "asset_quality_analyst",
+            "analysis": validated["analysis"],
+            "context": context,
+            "model": model,
+            "usage": usage,
+            "success": validated["success"]
+        }
+        
+        # Append to blackboard hypotheses using tool call
+        added_to_blackboard = False
+        if isinstance(blackboard_obj, dict) and "hypotheses" in blackboard_obj and self.mutate_tool:
+            append_result = self.mutate_tool.handle(session_id, {
+                "action": "nested_list_append",
+                "key": blackboard_key,
+                "path": ["hypotheses"],
+                "value": hypothesis_obj
+            })
+            if "error" not in append_result:
+                added_to_blackboard = True
+        
+        if save_to:
+            self.memory_tool.handle(session_id, {
+                "action": "set",
+                "key": save_to,
+                "value": hypothesis_obj
+            })
 
-                return {
-                    "content": {
-                        "analysis": analysis,
-                        "facts_analyzed": facts,
-                        "blackboard_key": blackboard_key,
-                        "blackboard_metadata": metadata,
-                        "model_used": model,
-                        "saved_to": save_to,
-                        "added_to_blackboard": added_to_blackboard,
-                        "usage": result.get("usage", {})
-                    }
-                }
-            return {"error": "No response generated from the model"}
+        # Always return a structured response with content
+        result = {
+            "content": {
+                "analysis": validated["analysis"],
+                "facts_analyzed": facts,
+                "blackboard_key": blackboard_key,
+                "blackboard_metadata": metadata,
+                "model_used": model,
+                "saved_to": save_to,
+                "added_to_blackboard": added_to_blackboard,
+                "usage": usage,
+                "success": validated["success"]
+            }
+        }
+        
+        if error:
+            result["error"] = error
+            
+        return result
 
-        except Exception as e:
-            return {"error": f"Analysis failed: {str(e)}"}
 
     def _build_prompt(self, facts: Any, context: str, metadata: Dict[str, Any], all_variables: List[str]) -> str:
         """Build the analysis prompt from facts and context."""

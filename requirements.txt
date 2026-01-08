@@ -3,3 +3,5 @@ click
 loguru
 pydantic
 azure-functions
+openai
+python-dotenv
