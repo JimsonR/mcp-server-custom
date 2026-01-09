@@ -110,3 +110,111 @@ def mcp(req: func.HttpRequest) -> func.HttpResponse:
 			mimetype="application/json",
 			headers=headers,
 		)
+
+
+@app.route(route="mcp/stream", methods=["POST", "OPTIONS"], auth_level=func.AuthLevel.FUNCTION)
+def mcp_stream(req: func.HttpRequest) -> func.HttpResponse:
+	"""
+	Streaming endpoint for MCP tool calls.
+	
+	Since Azure Functions doesn't support true SSE streaming,
+	this endpoint collects all streaming events and returns them as a JSON response.
+	The response includes all events in an array, allowing the client to process them.
+	"""
+	origin = req.headers.get("Origin")
+	allowed = get_cors_allowed_origins()
+	headers = _build_cors_headers(origin, allowed)
+
+	if req.method == "OPTIONS":
+		return func.HttpResponse(status_code=200, headers=headers)
+
+	session_id = req.headers.get("X-Session-ID", "http-session")
+	logger.info(f"Streaming endpoint - session_id from header: {session_id}")
+	_ensure_session(session_id)
+
+	try:
+		request_body = req.get_json()
+	except ValueError:
+		logger.error("Invalid JSON payload in streaming request")
+		return func.HttpResponse(
+			body=json.dumps({"error": "Invalid JSON"}),
+			status_code=400,
+			mimetype="application/json",
+			headers=headers,
+		)
+
+	server = get_mcp_server()
+	logger.info(f"Streaming endpoint - available sessions: {list(server.sessions.keys())}")
+	
+	# WORKAROUND: If streaming session has no variables, copy from main client session
+	# The mcp_agent_bridge uses different session IDs for streaming (stream_*) vs regular (client-*) calls
+	streaming_session = server.sessions.get(session_id, {})
+	streaming_memory = streaming_session.get("memory", {})
+	
+	if not streaming_memory:
+		# Find a client-* session that has variables and copy them
+		for other_session_id, other_session in server.sessions.items():
+			if other_session_id.startswith("client-"):
+				other_memory = other_session.get("memory", {})
+				if other_memory:
+					logger.info(f"Streaming session {session_id} empty - copying memory from {other_session_id}")
+					# Copy the memory reference
+					if session_id not in server.sessions:
+						server.sessions[session_id] = {}
+					server.sessions[session_id]["memory"] = other_memory
+					break
+
+	try:
+		# Collect all streaming events
+		events = []
+		final_analysis = ""
+		final_usage = {}
+		success = True
+		error_msg = None
+		
+		for event in server.handle_tools_call_streaming(request_body, session_id):
+			events.append(event)
+			event_type = event.get("type")
+			if event_type == "complete":
+				final_analysis = event.get("analysis", "")
+				final_usage = event.get("usage", {})
+				success = event.get("success", True)
+			elif event_type == "error":
+				error_msg = event.get("error")
+				success = False
+		
+		# Return JSON-RPC response with streaming metadata
+		if error_msg:
+			response_payload = {
+				"jsonrpc": "2.0",
+				"id": request_body.get("id"),
+				"error": {"code": -32000, "message": error_msg},
+				"streaming_events": events
+			}
+		else:
+			response_payload = {
+				"jsonrpc": "2.0",
+				"id": request_body.get("id"),
+				"result": {
+					"content": [{"type": "text", "text": final_analysis}],
+					"streaming": True,
+					"usage": final_usage,
+					"success": success,
+					"events": events  # Include all streaming events for debugging/processing
+				}
+			}
+		
+		return func.HttpResponse(
+			body=json.dumps(response_payload),
+			status_code=200,
+			mimetype="application/json",
+			headers=headers,
+		)
+	except Exception as exc:
+		logger.error(f"MCP streaming handler error: {exc}")
+		return func.HttpResponse(
+			body=json.dumps({"jsonrpc": "2.0", "error": {"code": -32000, "message": str(exc)}}),
+			status_code=500,
+			mimetype="application/json",
+			headers=headers,
+		)

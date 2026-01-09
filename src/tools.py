@@ -233,5 +233,49 @@ class ToolRegistry:
             )
             return {"error": str(e)}
 
+    def handle_tool_call_streaming(
+        self,
+        tool_name: str,
+        session_id: str,
+        arguments: Dict[str, Any],
+    ):
+        """
+        Handle a streaming tool call.
+        
+        Returns a generator that yields events for tools that support streaming.
+        For tools without streaming support, yields a single complete event.
+        """
+        tool = self.get_tool(tool_name)
+        if not tool:
+            yield {"type": "error", "error": f"Tool '{tool_name}' not found"}
+            return
+
+        try:
+            # Check if the tool supports streaming
+            if hasattr(tool, 'handle_streaming') and callable(getattr(tool, 'handle_streaming')):
+                logger.info(f"Starting streaming tool call for '{tool_name}'")
+                for event in tool.handle_streaming(session_id, arguments):
+                    yield event
+            else:
+                # Fallback to regular handle and yield as complete event
+                logger.info(f"Tool '{tool_name}' does not support streaming, using regular handle")
+                result = tool.handle(session_id, arguments)
+                if "error" in result:
+                    yield {"type": "error", "error": result["error"], "agent": tool_name}
+                else:
+                    content = result.get("content", {})
+                    analysis = content.get("analysis", "") if isinstance(content, dict) else str(content)
+                    yield {
+                        "type": "complete",
+                        "analysis": analysis,
+                        "agent": tool_name,
+                        "success": content.get("success", True) if isinstance(content, dict) else True,
+                        "usage": content.get("usage", {}) if isinstance(content, dict) else {}
+                    }
+        except Exception as e:
+            logger.error(f"Error in streaming tool call for '{tool_name}': {e}")
+            yield {"type": "error", "error": str(e), "agent": tool_name}
+
 
 tool_registry = ToolRegistry()
+

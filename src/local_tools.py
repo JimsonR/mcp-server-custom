@@ -6,7 +6,7 @@ import re
 import requests
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Generator, Iterator, List, Optional, Tuple
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -162,6 +162,128 @@ def _validate_analysis_response(
         "error": None
     }
 
+
+def _make_llm_call_streaming(
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    timeout: int = DEFAULT_TIMEOUT,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    agent_type: str = "unknown"
+) -> Generator[Dict[str, Any], None, None]:
+    """
+    Make streaming LLM call using OpenAI SDK.
+    
+    Yields:
+        Dict with streaming events:
+        - {"type": "chunk", "content": "...", "agent": "..."} - Partial content
+        - {"type": "reasoning", "content": "...", "agent": "..."} - Reasoning content (DeepSeek R1)
+        - {"type": "complete", "analysis": "...", "usage": {...}, "success": True} - Final result
+        - {"type": "error", "error": "...", "agent": "..."} - Error occurred
+    """
+    logger.info(f"Starting {agent_type} streaming LLM call with model {model}")
+    
+    try:
+        client = _get_openai_client(api_key)
+        
+        # Start streaming request
+        stream = client.chat.completions.create(
+            extra_headers={
+                "HTTP-Referer": "https://github.com/xendex-mcp-server",
+                "X-Title": f"Xendex MCP {agent_type.replace('_', ' ').title()}",
+            },
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            timeout=timeout,
+            max_tokens=max_tokens,
+            stream=True,
+        )
+        
+        # Accumulate content as we stream
+        accumulated_content = ""
+        accumulated_reasoning = ""
+        chunk_count = 0
+        
+        for chunk in stream:
+            chunk_count += 1
+            
+            if chunk.choices and len(chunk.choices) > 0:
+                delta = chunk.choices[0].delta
+                
+                # Check for content
+                if delta.content:
+                    accumulated_content += delta.content
+                    yield {
+                        "type": "chunk",
+                        "content": delta.content,
+                        "agent": agent_type,
+                        "chunk_index": chunk_count
+                    }
+                
+                # Check for reasoning (DeepSeek R1 via OpenRouter)
+                reasoning_delta = getattr(delta, 'reasoning', None)
+                if reasoning_delta:
+                    accumulated_reasoning += reasoning_delta
+                    yield {
+                        "type": "reasoning",
+                        "content": reasoning_delta,
+                        "agent": agent_type,
+                        "chunk_index": chunk_count
+                    }
+        
+        logger.info(f"{agent_type}: Streaming completed. Total chunks: {chunk_count}, Content length: {len(accumulated_content)}")
+        
+        # Use reasoning as content if content is empty (DeepSeek R1 behavior)
+        raw_content = accumulated_content
+        if not raw_content and accumulated_reasoning:
+            logger.info(f"{agent_type}: Content empty, using accumulated reasoning (length: {len(accumulated_reasoning)})")
+            raw_content = accumulated_reasoning
+        
+        # Extract final analysis
+        analysis = _extract_content_from_response(raw_content)
+        
+        # CRITICAL FALLBACK: If extraction returns empty but we have content, use raw
+        if not analysis and raw_content:
+            logger.warning(f"CRITICAL: Extraction failed for {agent_type} streaming, using raw content")
+            analysis = raw_content
+        
+        # Final fallback: return warning if still empty
+        if not analysis:
+            logger.error(f"{agent_type}: Empty analysis AND empty raw content from streaming")
+            analysis = f"[WARNING] Unable to generate {agent_type} analysis. The model returned an empty response."
+        
+        # Yield final complete event
+        yield {
+            "type": "complete",
+            "analysis": analysis,
+            "agent": agent_type,
+            "success": True,
+            "usage": {},  # Usage not available in streaming mode
+            "chunk_count": chunk_count,
+            "raw_content_length": len(raw_content),
+            "reasoning_length": len(accumulated_reasoning)
+        }
+        
+    except TimeoutError as e:
+        logger.error(f"{agent_type} streaming timeout: {e}")
+        yield {
+            "type": "error",
+            "error": f"{agent_type} agent timed out after {timeout} seconds",
+            "agent": agent_type,
+            "success": False
+        }
+    except Exception as e:
+        logger.error(f"{agent_type} streaming error: {e}")
+        yield {
+            "type": "error",
+            "error": f"{agent_type} agent failed: {str(e)}",
+            "agent": agent_type,
+            "success": False
+        }
 
 
 
@@ -1279,6 +1401,125 @@ class DebtAnalystTool:
         
         return "\n".join(prompt_parts)
 
+    def handle_streaming(self, session_id: str, arguments: Dict[str, Any]) -> Generator[Dict[str, Any], None, None]:
+        """
+        Streaming version of handle() that yields chunks as they're generated.
+        """
+        args = arguments or {}
+        blackboard_key = args.get("blackboard_key")
+        context = args.get("context", "")
+        api_key = args.get("api_key") or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPEN_ROUTER_API_KEY")
+        save_to = args.get("save_to")
+        model = args.get("model", "deepseek/deepseek-r1-0528:free")
+        timeout = args.get("timeout", DEFAULT_TIMEOUT)
+
+        logger.info(f"Starting debt analyst streaming for session {session_id}")
+
+        # Validate prerequisites
+        if not api_key:
+            yield {"type": "error", "error": "API key not configured", "agent": "debt_analyst"}
+            return
+
+        if not self.memory_tool:
+            yield {"type": "error", "error": "Memory tool not configured", "agent": "debt_analyst"}
+            return
+
+        # Get blackboard data
+        keys_result = self.memory_tool.handle(session_id, {"action": "keys"})
+        if "error" in keys_result:
+            yield {"type": "error", "error": keys_result["error"], "agent": "debt_analyst"}
+            return
+        all_variables = keys_result.get("content", {}).get("keys", [])
+        
+        if not all_variables:
+            yield {"type": "error", "error": "No variables found in memory store", "agent": "debt_analyst"}
+            return
+        
+        # Auto-discover blackboard
+        if blackboard_key:
+            get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
+            if "error" in get_result or get_result.get("content", {}).get("value") is None:
+                blackboard_key = None
+        
+        if not blackboard_key:
+            for k in all_variables:
+                get_result = self.memory_tool.handle(session_id, {"action": "get", "key": k})
+                if "error" not in get_result:
+                    val = get_result.get("content", {}).get("value")
+                    if isinstance(val, dict) and "facts" in val:
+                        blackboard_key = k
+                        break
+        
+        if not blackboard_key:
+            yield {"type": "error", "error": f"No blackboard found. Available: {all_variables}", "agent": "debt_analyst"}
+            return
+        
+        # Get blackboard object
+        get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
+        if "error" in get_result:
+            yield {"type": "error", "error": f"Blackboard key '{blackboard_key}' not found", "agent": "debt_analyst"}
+            return
+
+        blackboard_obj = get_result.get("content", {}).get("value")
+        if blackboard_obj is None:
+            yield {"type": "error", "error": f"Blackboard '{blackboard_key}' is empty", "agent": "debt_analyst"}
+            return
+        
+        # Extract facts and metadata
+        if isinstance(blackboard_obj, dict) and "facts" in blackboard_obj:
+            facts = blackboard_obj["facts"]
+            if facts is None:
+                yield {"type": "error", "error": f"Facts in blackboard '{blackboard_key}' is None", "agent": "debt_analyst"}
+                return
+            metadata = {k: v for k, v in blackboard_obj.items() if k != "facts"}
+        else:
+            facts = blackboard_obj
+            metadata = {}
+
+        prompt = self._build_prompt(facts, context, metadata, all_variables)
+        
+        system_prompt = """You are a debt analyst AI agent. Analyze debt structures, leverage ratios, interest coverage, debt maturities, covenants, and refinancing risks.
+
+IMPORTANT: After your reasoning process, provide your complete final analysis. Put your analysis in the main response, not just in thinking tags."""
+
+        # Stream the LLM response
+        final_analysis = None
+        for event in _make_llm_call_streaming(
+            api_key=api_key,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=prompt,
+            timeout=timeout,
+            max_tokens=DEFAULT_MAX_TOKENS,
+            agent_type="debt_analyst"
+        ):
+            yield event
+            if event.get("type") == "complete":
+                final_analysis = event.get("analysis")
+        
+        # Save to blackboard after streaming completes
+        if final_analysis and isinstance(blackboard_obj, dict) and "hypotheses" in blackboard_obj and self.mutate_tool:
+            hypothesis_obj = {
+                "analyst": "debt_analyst",
+                "analysis": final_analysis,
+                "context": context,
+                "model": model,
+                "streaming": True
+            }
+            self.mutate_tool.handle(session_id, {
+                "action": "nested_list_append",
+                "key": blackboard_key,
+                "path": ["hypotheses"],
+                "value": hypothesis_obj
+            })
+        
+        if save_to and final_analysis:
+            self.memory_tool.handle(session_id, {
+                "action": "set",
+                "key": save_to,
+                "value": {"analyst": "debt_analyst", "analysis": final_analysis, "streaming": True}
+            })
+
 
 @dataclass
 class LiquidityAnalystTool:
@@ -1561,6 +1802,134 @@ IMPORTANT: After your reasoning process, provide your complete final analysis. P
         ])
 
         return "\n".join(prompt_parts)
+
+    def handle_streaming(self, session_id: str, arguments: Dict[str, Any]) -> Generator[Dict[str, Any], None, None]:
+        """
+        Streaming version of handle() that yields chunks as they're generated.
+        
+        Yields:
+            Dict with streaming events:
+            - {"type": "chunk", "content": "..."} - Partial content
+            - {"type": "complete", "analysis": "...", "success": True} - Final result
+            - {"type": "error", "error": "..."} - Error occurred
+        """
+        args = arguments or {}
+        blackboard_key = args.get("blackboard_key")
+        context = args.get("context", "")
+        api_key = args.get("api_key") or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPEN_ROUTER_API_KEY")
+        save_to = args.get("save_to")
+        model = args.get("model", "deepseek/deepseek-r1-0528:free")
+        timeout = args.get("timeout", DEFAULT_TIMEOUT)
+
+        logger.info(f"Starting liquidity analyst streaming for session {session_id}")
+
+        # Validate prerequisites
+        if not api_key:
+            yield {"type": "error", "error": "API key not configured", "agent": "liquidity_analyst"}
+            return
+
+        if not self.memory_tool:
+            yield {"type": "error", "error": "Memory tool not configured", "agent": "liquidity_analyst"}
+            return
+
+        # Get blackboard data (reuse same logic as handle())
+        keys_result = self.memory_tool.handle(session_id, {"action": "keys"})
+        if "error" in keys_result:
+            yield {"type": "error", "error": keys_result["error"], "agent": "liquidity_analyst"}
+            return
+        all_variables = keys_result.get("content", {}).get("keys", [])
+        
+        if not all_variables:
+            yield {"type": "error", "error": "No variables found in memory store", "agent": "liquidity_analyst"}
+            return
+        
+        # Auto-discover blackboard
+        original_blackboard_key = blackboard_key
+        if blackboard_key:
+            get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
+            if "error" in get_result or get_result.get("content", {}).get("value") is None:
+                blackboard_key = None
+        
+        if not blackboard_key:
+            for k in all_variables:
+                get_result = self.memory_tool.handle(session_id, {"action": "get", "key": k})
+                if "error" not in get_result:
+                    val = get_result.get("content", {}).get("value")
+                    if isinstance(val, dict) and "facts" in val:
+                        blackboard_key = k
+                        break
+        
+        if not blackboard_key:
+            yield {"type": "error", "error": f"No blackboard found. Available: {all_variables}", "agent": "liquidity_analyst"}
+            return
+        
+        # Get blackboard object
+        get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
+        if "error" in get_result:
+            yield {"type": "error", "error": f"Blackboard key '{blackboard_key}' not found", "agent": "liquidity_analyst"}
+            return
+
+        blackboard_obj = get_result.get("content", {}).get("value")
+        if blackboard_obj is None:
+            yield {"type": "error", "error": f"Blackboard '{blackboard_key}' is empty", "agent": "liquidity_analyst"}
+            return
+        
+        # Extract facts and metadata
+        if isinstance(blackboard_obj, dict) and "facts" in blackboard_obj:
+            facts = blackboard_obj["facts"]
+            if facts is None:
+                yield {"type": "error", "error": f"Facts in blackboard '{blackboard_key}' is None", "agent": "liquidity_analyst"}
+                return
+            metadata = {k: v for k, v in blackboard_obj.items() if k != "facts"}
+        else:
+            facts = blackboard_obj
+            metadata = {}
+
+        prompt = self._build_prompt(facts, context, metadata, all_variables)
+        
+        system_prompt = """You are a liquidity analyst AI agent. Analyze cash flow, working capital, current ratios, quick ratios, and liquidity positions. Identify liquidity risks and opportunities.
+
+IMPORTANT: After your reasoning process, provide your complete final analysis. Put your analysis in the main response, not just in thinking tags."""
+
+        # Stream the LLM response
+        final_analysis = None
+        for event in _make_llm_call_streaming(
+            api_key=api_key,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=prompt,
+            timeout=timeout,
+            max_tokens=DEFAULT_MAX_TOKENS,
+            agent_type="liquidity_analyst"
+        ):
+            yield event
+            
+            # Capture final analysis from complete event
+            if event.get("type") == "complete":
+                final_analysis = event.get("analysis")
+        
+        # Save to blackboard after streaming completes
+        if final_analysis and isinstance(blackboard_obj, dict) and "hypotheses" in blackboard_obj and self.mutate_tool:
+            hypothesis_obj = {
+                "analyst": "liquidity_analyst",
+                "analysis": final_analysis,
+                "context": context,
+                "model": model,
+                "streaming": True
+            }
+            self.mutate_tool.handle(session_id, {
+                "action": "nested_list_append",
+                "key": blackboard_key,
+                "path": ["hypotheses"],
+                "value": hypothesis_obj
+            })
+        
+        if save_to and final_analysis:
+            self.memory_tool.handle(session_id, {
+                "action": "set",
+                "key": save_to,
+                "value": {"analyst": "liquidity_analyst", "analysis": final_analysis, "streaming": True}
+            })
 
 
 @dataclass
@@ -1846,6 +2215,125 @@ IMPORTANT: After your reasoning process, provide your complete final analysis. P
 
         return "\n".join(prompt_parts)
 
+    def handle_streaming(self, session_id: str, arguments: Dict[str, Any]) -> Generator[Dict[str, Any], None, None]:
+        """
+        Streaming version of handle() that yields chunks as they're generated.
+        """
+        args = arguments or {}
+        blackboard_key = args.get("blackboard_key")
+        context = args.get("context", "")
+        api_key = args.get("api_key") or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPEN_ROUTER_API_KEY")
+        save_to = args.get("save_to")
+        model = args.get("model", "deepseek/deepseek-r1-0528:free")
+        timeout = args.get("timeout", DEFAULT_TIMEOUT)
+
+        logger.info(f"Starting QoE analyst streaming for session {session_id}")
+
+        # Validate prerequisites
+        if not api_key:
+            yield {"type": "error", "error": "API key not configured", "agent": "qoe_analyst"}
+            return
+
+        if not self.memory_tool:
+            yield {"type": "error", "error": "Memory tool not configured", "agent": "qoe_analyst"}
+            return
+
+        # Get blackboard data
+        keys_result = self.memory_tool.handle(session_id, {"action": "keys"})
+        if "error" in keys_result:
+            yield {"type": "error", "error": keys_result["error"], "agent": "qoe_analyst"}
+            return
+        all_variables = keys_result.get("content", {}).get("keys", [])
+        
+        if not all_variables:
+            yield {"type": "error", "error": "No variables found in memory store", "agent": "qoe_analyst"}
+            return
+        
+        # Auto-discover blackboard
+        if blackboard_key:
+            get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
+            if "error" in get_result or get_result.get("content", {}).get("value") is None:
+                blackboard_key = None
+        
+        if not blackboard_key:
+            for k in all_variables:
+                get_result = self.memory_tool.handle(session_id, {"action": "get", "key": k})
+                if "error" not in get_result:
+                    val = get_result.get("content", {}).get("value")
+                    if isinstance(val, dict) and "facts" in val:
+                        blackboard_key = k
+                        break
+        
+        if not blackboard_key:
+            yield {"type": "error", "error": f"No blackboard found. Available: {all_variables}", "agent": "qoe_analyst"}
+            return
+        
+        # Get blackboard object
+        get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
+        if "error" in get_result:
+            yield {"type": "error", "error": f"Blackboard key '{blackboard_key}' not found", "agent": "qoe_analyst"}
+            return
+
+        blackboard_obj = get_result.get("content", {}).get("value")
+        if blackboard_obj is None:
+            yield {"type": "error", "error": f"Blackboard '{blackboard_key}' is empty", "agent": "qoe_analyst"}
+            return
+        
+        # Extract facts and metadata
+        if isinstance(blackboard_obj, dict) and "facts" in blackboard_obj:
+            facts = blackboard_obj["facts"]
+            if facts is None:
+                yield {"type": "error", "error": f"Facts in blackboard '{blackboard_key}' is None", "agent": "qoe_analyst"}
+                return
+            metadata = {k: v for k, v in blackboard_obj.items() if k != "facts"}
+        else:
+            facts = blackboard_obj
+            metadata = {}
+
+        prompt = self._build_prompt(facts, context, metadata, all_variables)
+        
+        system_prompt = """You are a Quality of Earnings (QoE) analyst AI agent. Evaluate the sustainability and quality of reported earnings, identify one-time items, assess revenue recognition, and detect red flags.
+
+IMPORTANT: After your reasoning process, provide your complete final analysis. Put your analysis in the main response, not just in thinking tags."""
+
+        # Stream the LLM response
+        final_analysis = None
+        for event in _make_llm_call_streaming(
+            api_key=api_key,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=prompt,
+            timeout=timeout,
+            max_tokens=DEFAULT_MAX_TOKENS,
+            agent_type="qoe_analyst"
+        ):
+            yield event
+            if event.get("type") == "complete":
+                final_analysis = event.get("analysis")
+        
+        # Save to blackboard after streaming completes
+        if final_analysis and isinstance(blackboard_obj, dict) and "hypotheses" in blackboard_obj and self.mutate_tool:
+            hypothesis_obj = {
+                "analyst": "qoe_analyst",
+                "analysis": final_analysis,
+                "context": context,
+                "model": model,
+                "streaming": True
+            }
+            self.mutate_tool.handle(session_id, {
+                "action": "nested_list_append",
+                "key": blackboard_key,
+                "path": ["hypotheses"],
+                "value": hypothesis_obj
+            })
+        
+        if save_to and final_analysis:
+            self.memory_tool.handle(session_id, {
+                "action": "set",
+                "key": save_to,
+                "value": {"analyst": "qoe_analyst", "analysis": final_analysis, "streaming": True}
+            })
+
 
 @dataclass
 class AssetQualityAnalystTool:
@@ -2128,6 +2616,125 @@ IMPORTANT: After your reasoning process, provide your complete final analysis. P
         ])
 
         return "\n".join(prompt_parts)
+
+    def handle_streaming(self, session_id: str, arguments: Dict[str, Any]) -> Generator[Dict[str, Any], None, None]:
+        """
+        Streaming version of handle() that yields chunks as they're generated.
+        """
+        args = arguments or {}
+        blackboard_key = args.get("blackboard_key")
+        context = args.get("context", "")
+        api_key = args.get("api_key") or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPEN_ROUTER_API_KEY")
+        save_to = args.get("save_to")
+        model = args.get("model", "deepseek/deepseek-r1-0528:free")
+        timeout = args.get("timeout", DEFAULT_TIMEOUT)
+
+        logger.info(f"Starting asset quality analyst streaming for session {session_id}")
+
+        # Validate prerequisites
+        if not api_key:
+            yield {"type": "error", "error": "API key not configured", "agent": "asset_quality_analyst"}
+            return
+
+        if not self.memory_tool:
+            yield {"type": "error", "error": "Memory tool not configured", "agent": "asset_quality_analyst"}
+            return
+
+        # Get blackboard data
+        keys_result = self.memory_tool.handle(session_id, {"action": "keys"})
+        if "error" in keys_result:
+            yield {"type": "error", "error": keys_result["error"], "agent": "asset_quality_analyst"}
+            return
+        all_variables = keys_result.get("content", {}).get("keys", [])
+        
+        if not all_variables:
+            yield {"type": "error", "error": "No variables found in memory store", "agent": "asset_quality_analyst"}
+            return
+        
+        # Auto-discover blackboard
+        if blackboard_key:
+            get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
+            if "error" in get_result or get_result.get("content", {}).get("value") is None:
+                blackboard_key = None
+        
+        if not blackboard_key:
+            for k in all_variables:
+                get_result = self.memory_tool.handle(session_id, {"action": "get", "key": k})
+                if "error" not in get_result:
+                    val = get_result.get("content", {}).get("value")
+                    if isinstance(val, dict) and "facts" in val:
+                        blackboard_key = k
+                        break
+        
+        if not blackboard_key:
+            yield {"type": "error", "error": f"No blackboard found. Available: {all_variables}", "agent": "asset_quality_analyst"}
+            return
+        
+        # Get blackboard object
+        get_result = self.memory_tool.handle(session_id, {"action": "get", "key": blackboard_key})
+        if "error" in get_result:
+            yield {"type": "error", "error": f"Blackboard key '{blackboard_key}' not found", "agent": "asset_quality_analyst"}
+            return
+
+        blackboard_obj = get_result.get("content", {}).get("value")
+        if blackboard_obj is None:
+            yield {"type": "error", "error": f"Blackboard '{blackboard_key}' is empty", "agent": "asset_quality_analyst"}
+            return
+        
+        # Extract facts and metadata
+        if isinstance(blackboard_obj, dict) and "facts" in blackboard_obj:
+            facts = blackboard_obj["facts"]
+            if facts is None:
+                yield {"type": "error", "error": f"Facts in blackboard '{blackboard_key}' is None", "agent": "asset_quality_analyst"}
+                return
+            metadata = {k: v for k, v in blackboard_obj.items() if k != "facts"}
+        else:
+            facts = blackboard_obj
+            metadata = {}
+
+        prompt = self._build_prompt(facts, context, metadata, all_variables)
+        
+        system_prompt = """You are an asset quality analyst AI agent. Assess credit risk, loan quality, investment portfolio health, non-performing assets, provisions, and asset impairment risks.
+
+IMPORTANT: After your reasoning process, provide your complete final analysis. Put your analysis in the main response, not just in thinking tags."""
+
+        # Stream the LLM response
+        final_analysis = None
+        for event in _make_llm_call_streaming(
+            api_key=api_key,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=prompt,
+            timeout=timeout,
+            max_tokens=DEFAULT_MAX_TOKENS,
+            agent_type="asset_quality_analyst"
+        ):
+            yield event
+            if event.get("type") == "complete":
+                final_analysis = event.get("analysis")
+        
+        # Save to blackboard after streaming completes
+        if final_analysis and isinstance(blackboard_obj, dict) and "hypotheses" in blackboard_obj and self.mutate_tool:
+            hypothesis_obj = {
+                "analyst": "asset_quality_analyst",
+                "analysis": final_analysis,
+                "context": context,
+                "model": model,
+                "streaming": True
+            }
+            self.mutate_tool.handle(session_id, {
+                "action": "nested_list_append",
+                "key": blackboard_key,
+                "path": ["hypotheses"],
+                "value": hypothesis_obj
+            })
+        
+        if save_to and final_analysis:
+            self.memory_tool.handle(session_id, {
+                "action": "set",
+                "key": save_to,
+                "value": {"analyst": "asset_quality_analyst", "analysis": final_analysis, "streaming": True}
+            })
 
 
 @dataclass

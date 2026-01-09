@@ -322,6 +322,9 @@ class MCPServer:
             return self.handle_tools_list(request)
         elif method == "tools/call":
             return self.handle_tools_call(request, session_id)
+        elif method == "tools/call/stream":
+            # For non-streaming HTTP contexts, collect all events and return final result
+            return self._collect_streaming_response(request, session_id)
         elif method == "resources/list":
             return self.handle_resources_list(request)
         elif method == "resources/read":
@@ -335,6 +338,65 @@ class MCPServer:
                     "message": f"Method not found: {method}",
                 },
             }
+
+    def handle_tools_call_streaming(self, request: Dict[str, Any], session_id: str):
+        """
+        Generator that yields streaming events for a tool call.
+        Use this method for SSE endpoints.
+        """
+        params = request.get("params", {})
+        tool_name = params.get("name")
+        arguments = params.get("arguments", {})
+
+        for event in get_tool_registry().handle_tool_call_streaming(
+            tool_name, session_id, arguments
+        ):
+            yield event
+
+    def _collect_streaming_response(self, request: Dict[str, Any], session_id: str) -> Dict[str, Any]:
+        """
+        Collect all streaming events and return final result.
+        Used for non-SSE contexts that still want to use streaming tools.
+        """
+        params = request.get("params", {})
+        tool_name = params.get("name")
+        
+        final_analysis = ""
+        final_usage = {}
+        success = True
+        error_msg = None
+        
+        for event in self.handle_tools_call_streaming(request, session_id):
+            event_type = event.get("type")
+            if event_type == "complete":
+                final_analysis = event.get("analysis", "")
+                final_usage = event.get("usage", {})
+                success = event.get("success", True)
+            elif event_type == "error":
+                error_msg = event.get("error")
+                success = False
+        
+        if error_msg:
+            return {
+                "jsonrpc": "2.0",
+                "id": request.get("id"),
+                "error": {"code": -32000, "message": error_msg},
+            }
+        
+        return {
+            "jsonrpc": "2.0",
+            "id": request.get("id"),
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": final_analysis
+                }],
+                "streaming": True,
+                "usage": final_usage,
+                "success": success
+            },
+        }
+
 
     def handle_batch_request(
         self,
@@ -395,6 +457,12 @@ class MCPServer:
 class MCPHTTPHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split("?")[0].rstrip("/")
+        
+        # Handle SSE streaming endpoint
+        if path in ["/api/mcp/stream", "/mcp/stream"]:
+            self._handle_stream_request()
+            return
+            
         if path not in ["/api/mcp", "/mcp"]:
             self.send_error(404)
             return
@@ -432,6 +500,49 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
                 "jsonrpc": "2.0",
                 "error": {"code": -32000, "message": str(e)}
             }).encode("utf-8"))
+
+    def _handle_stream_request(self):
+        """Handle SSE streaming request for tool calls."""
+        try:
+            content_length = int(self.headers["Content-Length"])
+            data = json.loads(self.rfile.read(content_length).decode("utf-8"))
+
+            session_id = self.headers.get("X-Session-ID", "http-session")
+            server = get_mcp_server()
+            if session_id not in server.sessions:
+                server.create_session(session_id)
+
+            # Set up SSE response headers
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self._set_cors_headers()
+            self.end_headers()
+
+            # Stream events
+            for event in server.handle_tools_call_streaming(data, session_id):
+                event_type = event.get("type", "message")
+                event_data = json.dumps(event)
+                
+                # Format as SSE
+                sse_message = f"event: {event_type}\ndata: {event_data}\n\n"
+                self.wfile.write(sse_message.encode("utf-8"))
+                self.wfile.flush()
+            
+            # Send end event
+            self.wfile.write(b"event: end\ndata: {}\n\n")
+            self.wfile.flush()
+
+        except Exception as e:
+            logger.error(f"SSE streaming error: {e}")
+            error_event = json.dumps({"type": "error", "error": str(e)})
+            try:
+                self.wfile.write(f"event: error\ndata: {error_event}\n\n".encode("utf-8"))
+                self.wfile.flush()
+            except Exception:
+                pass
+
 
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/")
