@@ -1,438 +1,229 @@
 {
   "tools": [
     {
-      "name": "memory_store",
-      "description": "Session-scoped in-memory variables/lists (set/get/append/etc).",
+      "name": "get_historical_stock_prices",
+      "description": "Get historical stock prices for a given ticker symbol from yahoo finance. Includes: Date, Open, High, Low, Close, Volume, Adj Close.",
       "api_base": "local",
-      "local_tool": "memory_store",
+      "local_tool": "get_historical_stock_prices",
       "input_schema": {
         "type": "object",
         "properties": {
-          "action": {
+          "ticker": {
             "type": "string",
-            "description": "Operation to perform",
-            "enum": ["set", "get", "delete", "keys", "clear", "append", "extend", "pop", "dump"]
+            "description": "Stock ticker symbol (e.g. AAPL)"
           },
-          "key": {"type": "string", "description": "Variable name"},
-          "value": {
-            "description": "JSON-serializable value",
-            "type": ["string", "number", "object", "array", "boolean", "null"]
+          "period": {
+            "type": "string",
+            "description": "Time period (1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max)",
+            "default": "1mo"
           },
-          "values": {
-            "description": "List of values for extend",
-            "type": "array",
-            "items": {"type": ["string", "number", "object", "array", "boolean", "null"]}
-          },
-          "default": {
-            "description": "Default returned when key is missing (get)",
-            "type": ["string", "number", "object", "array", "boolean", "null"]
-          },
-          "index": {"description": "Index for pop (defaults to -1)", "type": "integer"}
+          "interval": {
+            "type": "string",
+            "description": "Data interval (1m,2m,5m,15m,30m,60m,90m,1h,1d,5d,1wk,1mo,3mo)",
+            "default": "1d"
+          }
         },
-        "required": ["action"],
-        "additionalProperties": false
+        "required": [
+          "ticker"
+        ]
       }
     },
     {
-      "name": "memory_mutate",
-      "description": "Mutate existing in-memory variables (insert, remove, update, increment, toggle, etc.).",
+      "name": "get_stock_info",
+      "description": "Get stock information for a given ticker symbol from yahoo finance. Includes: Stock Price & Trading Info, Company Information, Financial Metrics, Earnings & Revenue, Margins & Returns, Dividends, Balance Sheet, Ownership, Analyst Coverage, Risk Metrics.",
       "api_base": "local",
-      "local_tool": "memory_mutate",
+      "local_tool": "get_stock_info",
       "input_schema": {
         "type": "object",
         "properties": {
-          "action": {
+          "ticker": {
             "type": "string",
-            "description": "Mutation operation",
+            "description": "Stock ticker symbol (e.g. AAPL)"
+          }
+        },
+        "required": [
+          "ticker"
+        ]
+      }
+    },
+    {
+      "name": "get_yahoo_finance_news",
+      "description": "Get news for a given ticker symbol from yahoo finance.",
+      "api_base": "local",
+      "local_tool": "get_yahoo_finance_news",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "ticker": {
+            "type": "string",
+            "description": "Stock ticker symbol (e.g. AAPL)"
+          }
+        },
+        "required": [
+          "ticker"
+        ]
+      }
+    },
+    {
+      "name": "get_stock_actions",
+      "description": "Get stock dividends and stock splits for a given ticker symbol from yahoo finance.",
+      "api_base": "local",
+      "local_tool": "get_stock_actions",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "ticker": {
+            "type": "string",
+            "description": "Stock ticker symbol (e.g. AAPL)"
+          }
+        },
+        "required": [
+          "ticker"
+        ]
+      }
+    },
+    {
+      "name": "get_financial_statement",
+      "description": "Get financial statement for a given ticker symbol from yahoo finance. Choose from: income_stmt, quarterly_income_stmt, balance_sheet, quarterly_balance_sheet, cashflow, quarterly_cashflow.",
+      "api_base": "local",
+      "local_tool": "get_financial_statement",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "ticker": {
+            "type": "string",
+            "description": "Stock ticker symbol (e.g. AAPL)"
+          },
+          "financial_type": {
+            "type": "string",
+            "description": "Type of financial statement",
             "enum": [
-              "list_insert",
-              "list_remove",
-              "list_reverse",
-              "list_sort",
-              "dict_update",
-              "dict_merge",
-              "dict_delete_key",
-              "dict_get_nested",
-              "dict_set_nested",
-              "increment",
-              "decrement",
-              "multiply",
-              "toggle_bool",
-              "string_concat",
-              "string_replace"
+              "income_stmt",
+              "quarterly_income_stmt",
+              "balance_sheet",
+              "quarterly_balance_sheet",
+              "cashflow",
+              "quarterly_cashflow"
+            ]
+          }
+        },
+        "required": [
+          "ticker",
+          "financial_type"
+        ]
+      }
+    },
+    {
+      "name": "get_holder_info",
+      "description": "Get holder information for a given ticker symbol from yahoo finance. Choose from: major_holders, institutional_holders, mutualfund_holders, insider_transactions, insider_purchases, insider_roster_holders.",
+      "api_base": "local",
+      "local_tool": "get_holder_info",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "ticker": {
+            "type": "string",
+            "description": "Stock ticker symbol (e.g. AAPL)"
+          },
+          "holder_type": {
+            "type": "string",
+            "description": "Type of holder information",
+            "enum": [
+              "major_holders",
+              "institutional_holders",
+              "mutualfund_holders",
+              "insider_transactions",
+              "insider_purchases",
+              "insider_roster_holders"
+            ]
+          }
+        },
+        "required": [
+          "ticker",
+          "holder_type"
+        ]
+      }
+    },
+    {
+      "name": "get_option_expiration_dates",
+      "description": "Fetch the available options expiration dates for a given ticker symbol.",
+      "api_base": "local",
+      "local_tool": "get_option_expiration_dates",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "ticker": {
+            "type": "string",
+            "description": "Stock ticker symbol (e.g. AAPL)"
+          }
+        },
+        "required": [
+          "ticker"
+        ]
+      }
+    },
+    {
+      "name": "get_option_chain",
+      "description": "Fetch the option chain for a given ticker symbol, expiration date, and option type.",
+      "api_base": "local",
+      "local_tool": "get_option_chain",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "ticker": {
+            "type": "string",
+            "description": "Stock ticker symbol (e.g. AAPL)"
+          },
+          "expiration_date": {
+            "type": "string",
+            "description": "Expiration date (YYYY-MM-DD)"
+          },
+          "option_type": {
+            "type": "string",
+            "description": "Option type",
+            "enum": [
+              "calls",
+              "puts"
+            ]
+          }
+        },
+        "required": [
+          "ticker",
+          "expiration_date",
+          "option_type"
+        ]
+      }
+    },
+    {
+      "name": "get_recommendations",
+      "description": "Get recommendations or upgrades/downgrades for a given ticker symbol from yahoo finance. Choose from: recommendations, upgrades_downgrades.",
+      "api_base": "local",
+      "local_tool": "get_recommendations",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "ticker": {
+            "type": "string",
+            "description": "Stock ticker symbol (e.g. AAPL)"
+          },
+          "recommendation_type": {
+            "type": "string",
+            "description": "Type of recommendation",
+            "enum": [
+              "recommendations",
+              "upgrades_downgrades"
             ]
           },
-          "key": {"type": "string", "description": "Variable name"},
-          "index": {"type": "integer", "description": "Index for list operations"},
-          "value": {
-            "description": "Value to insert/use",
-            "type": ["string", "number", "object", "array", "boolean", "null"]
-          },
-          "old": {"type": "string", "description": "Old substring (string_replace)"},
-          "new": {"type": "string", "description": "New substring (string_replace)"},
-          "amount": {"type": "number", "description": "Amount for increment/decrement/multiply"},
-          "reverse": {"type": "boolean", "description": "Reverse sort order"},
-          "path": {
-            "type": "array",
-            "description": "Nested path for dict operations (e.g., ['a', 'b', 'c'])",
-            "items": {"type": "string"}
-          },
-          "updates": {
-            "type": "object",
-            "description": "Key-value pairs to update (dict_update/dict_merge)",
-            "additionalProperties": true
-          },
-          "dict_key": {"type": "string", "description": "Key to delete from dict"}
-        },
-        "required": ["action", "key"],
-        "additionalProperties": false
-      }
-    },
-    {
-      "name": "create_variable",
-      "description": "Create a new object or variable in memory with a given name and value. Supports all JSON types: strings, numbers, objects, arrays, booleans, and null.",
-      "api_base": "local",
-      "local_tool": "create_variable",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "name": {
-            "type": "string",
-            "description": "The name of the variable to create"
-          },
-          "value": {
-            "description": "The value to assign (can be any JSON type: string, number, object, array, boolean, or null)",
-            "type": ["string", "number", "object", "array", "boolean", "null"]
-          },
-          "type": {
-            "type": "string",
-            "description": "Optional type hint for the variable (e.g., 'string', 'number', 'object', 'array', 'boolean')",
-            "enum": ["string", "number", "object", "array", "boolean", "null"]
-          },
-          "overwrite": {
-            "type": "boolean",
-            "description": "Whether to overwrite if variable already exists (default: false)",
-            "default": false
+          "months_back": {
+            "type": "integer",
+            "description": "Months back for upgrades/downgrades",
+            "default": 12
           }
         },
-        "required": ["name", "value"],
-        "additionalProperties": false
-      }
-    },
-    {
-      "name": "debt_analyst_agent",
-      "description": "AI agent that automatically discovers and reads facts from blackboard variables in memory, then generates debt analysis hypotheses using DeepSeek reasoning model. Can auto-discover variables with 'facts' property.",
-      "api_base": "local",
-      "local_tool": "debt_analyst_agent",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "blackboard_key": {
-            "type": "string",
-            "description": "Optional: The key in memory store containing facts/data to analyze. If not provided, tool will auto-discover variables with 'facts' property or variables named 'blackboard'"
-          },
-          "context": {
-            "type": "string",
-            "description": "Additional context or specific question for the debt analyst"
-          },
-          "api_key": {
-            "type": "string",
-            "description": "OpenRouter API key (optional, can be set via environment variable OPENROUTER_API_KEY)"
-          },
-          "save_to": {
-            "type": "string",
-            "description": "Optional key to save the hypothesis results to in memory store"
-          },
-          "model": {
-            "type": "string",
-            "description": "Model to use (default: deepseek/deepseek-r1-0528:free)",
-            "default": "deepseek/deepseek-r1-0528:free"
-          },
-          "timeout": {
-            "type": "number",
-            "description": "API request timeout in seconds (default: 120). Increase if using reasoning models that need more time.",
-            "default": 120
-          },
-          "enable_self_critique": {
-            "type": "boolean",
-            "description": "Enable automatic self-critique to iteratively improve the analysis (default: false)",
-            "default": false
-          },
-          "max_iterations": {
-            "type": "number",
-            "description": "Maximum number of critique-refinement iterations when self-critique is enabled (default: 2)",
-            "default": 2
-          }
-        },
-        "required": [],
-        "additionalProperties": false
-      }    },
-    {
-      "name": "liquidity_analyst_agent",
-      "description": "AI agent that analyzes liquidity positions, cash flow, and working capital from blackboard data using AI reasoning.",
-      "api_base": "local",
-      "local_tool": "liquidity_analyst_agent",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "blackboard_key": {
-            "type": "string",
-            "description": "Optional: The key in memory store containing facts/data to analyze. Auto-discovers if not provided."
-          },
-          "context": {
-            "type": "string",
-            "description": "Additional context or specific question for the liquidity analyst"
-          },
-          "api_key": {
-            "type": "string",
-            "description": "OpenRouter API key (optional, can be set via environment variable)"
-          },
-          "save_to": {
-            "type": "string",
-            "description": "Optional key to save the analysis results to in memory store"
-          },
-          "model": {
-            "type": "string",
-            "description": "Model to use (default: deepseek/deepseek-r1-0528:free)",
-            "default": "deepseek/deepseek-r1-0528:free"
-          },
-          "timeout": {
-            "type": "number",
-            "description": "API request timeout in seconds (default: 120)",
-            "default": 120
-          },
-          "enable_self_critique": {
-            "type": "boolean",
-            "description": "Enable automatic self-critique to iteratively improve the analysis (default: false)",
-            "default": false
-          },
-          "max_iterations": {
-            "type": "number",
-            "description": "Maximum number of critique-refinement iterations when self-critique is enabled (default: 2)",
-            "default": 2
-          }
-        },
-        "required": [],
-        "additionalProperties": false
-      }
-    },
-    {
-      "name": "qoe_analyst_agent",
-      "description": "AI agent that performs Quality of Earnings (QoE) analysis, evaluating earnings quality, sustainability, and potential red flags.",
-      "api_base": "local",
-      "local_tool": "qoe_analyst_agent",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "blackboard_key": {
-            "type": "string",
-            "description": "Optional: The key in memory store containing facts/data to analyze. Auto-discovers if not provided."
-          },
-          "context": {
-            "type": "string",
-            "description": "Additional context or specific question for the QoE analyst"
-          },
-          "api_key": {
-            "type": "string",
-            "description": "OpenRouter API key (optional, can be set via environment variable)"
-          },
-          "save_to": {
-            "type": "string",
-            "description": "Optional key to save the analysis results to in memory store"
-          },
-          "model": {
-            "type": "string",
-            "description": "Model to use (default: deepseek/deepseek-r1-0528:free)",
-            "default": "deepseek/deepseek-r1-0528:free"
-          },
-          "timeout": {
-            "type": "number",
-            "description": "API request timeout in seconds (default: 120)",
-            "default": 120
-          },
-          "enable_self_critique": {
-            "type": "boolean",
-            "description": "Enable automatic self-critique to iteratively improve the analysis (default: false)",
-            "default": false
-          },
-          "max_iterations": {
-            "type": "number",
-            "description": "Maximum number of critique-refinement iterations when self-critique is enabled (default: 2)",
-            "default": 2
-          }
-        },
-        "required": [],
-        "additionalProperties": false
-      }
-    },
-    {
-      "name": "asset_quality_analyst_agent",
-      "description": "AI agent that analyzes asset quality, performing risk assessment on loans, investments, and other assets.",
-      "api_base": "local",
-      "local_tool": "asset_quality_analyst_agent",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "blackboard_key": {
-            "type": "string",
-            "description": "Optional: The key in memory store containing facts/data to analyze. Auto-discovers if not provided."
-          },
-          "context": {
-            "type": "string",
-            "description": "Additional context or specific question for the asset quality analyst"
-          },
-          "api_key": {
-            "type": "string",
-            "description": "OpenRouter API key (optional, can be set via environment variable)"
-          },
-          "save_to": {
-            "type": "string",
-            "description": "Optional key to save the analysis results to in memory store"
-          },
-          "model": {
-            "type": "string",
-            "description": "Model to use (default: deepseek/deepseek-r1-0528:free)",
-            "default": "deepseek/deepseek-r1-0528:free"
-          },
-          "timeout": {
-            "type": "number",
-            "description": "API request timeout in seconds (default: 120)",
-            "default": 120
-          },
-          "enable_self_critique": {
-            "type": "boolean",
-            "description": "Enable automatic self-critique to iteratively improve the analysis (default: false)",
-            "default": false
-          },
-          "max_iterations": {
-            "type": "number",
-            "description": "Maximum number of critique-refinement iterations when self-critique is enabled (default: 2)",
-            "default": 2
-          }
-        },
-        "required": [],
-        "additionalProperties": false
-      }    },
-    {
-      "name": "consolidated_analyst_critique",
-      "description": "Batch critique multiple analyst responses together for cost efficiency. Analyzes all analyst outputs (debt, liquidity, QoE, asset quality) simultaneously to identify conflicts, gaps, and provide consolidated feedback.",
-      "api_base": "local",
-      "local_tool": "consolidated_analyst_critique",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "analyst_responses": {
-            "type": "array",
-            "description": "Array of analyst response objects with agent type and response content",
-            "items": {
-              "type": "object",
-              "properties": {
-                "agent": {
-                  "type": "string",
-                  "description": "Type of analyst (debt_analyst, liquidity_analyst, qoe_analyst, asset_quality_analyst)",
-                  "enum": ["debt_analyst", "liquidity_analyst", "qoe_analyst", "asset_quality_analyst"]
-                },
-                "response": {
-                  "type": "string",
-                  "description": "The analysis response text from the analyst"
-                },
-                "response_key": {
-                  "type": "string",
-                  "description": "Optional memory key where response is stored"
-                }
-              },
-              "required": ["agent", "response"]
-            }
-          },
-          "critique_mode": {
-            "type": "string",
-            "description": "Mode of critique: cross_analysis (check consistency across analysts), conflicts_only (identify contradictions), comprehensive (detailed review)",
-            "enum": ["cross_analysis", "conflicts_only", "comprehensive"],
-            "default": "cross_analysis"
-          },
-          "use_cheap_model": {
-            "type": "boolean",
-            "description": "Use cost-efficient model (gpt-4o-mini) instead of reasoning model for critique (default: true)",
-            "default": true
-          },
-          "model": {
-            "type": "string",
-            "description": "Override model selection (default: else deepseek/deepseek-r1-0528:free)"
-          },
-          "context": {
-            "type": "string",
-            "description": "Additional context about the company or analysis scenario"
-          },
-          "api_key": {
-            "type": "string",
-            "description": "OpenRouter API key (optional, can be set via environment variable)"
-          },
-          "save_to": {
-            "type": "string",
-            "description": "Optional key to save the consolidated critique to in memory store"
-          },
-          "timeout": {
-            "type": "number",
-            "description": "API request timeout in seconds (default: 60)",
-            "default": 60
-          }
-        },
-        "required": ["analyst_responses"],
-        "additionalProperties": false
-      }
-    },
-    {
-      "name": "critic_agent",
-      "description": "AI agent that critically evaluates and provides feedback on other agents' responses, hypotheses, and analyses. Identifies weaknesses, logical gaps, unsupported claims, and suggests improvements. Can be used iteratively to refine agent outputs.",
-      "api_base": "local",
-      "local_tool": "critic_agent",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "response_to_critique": {
-            "type": "string",
-            "description": "The response, hypothesis, or analysis to critique. Can be text or a memory key containing the response."
-          },
-          "blackboard_key": {
-            "type": "string",
-            "description": "Optional: The key in memory store containing the original facts/data that the response was based on. Helps provide context for critique."
-          },
-          "critique_focus": {
-            "type": "string",
-            "description": "Optional: Specific aspects to focus on (e.g., 'logical consistency', 'evidence quality', 'completeness', 'assumptions', 'risk assessment')",
-            "enum": ["logical_consistency", "evidence_quality", "completeness", "assumptions", "risk_assessment", "methodology", "conclusions", "all"]
-          },
-          "context": {
-            "type": "string",
-            "description": "Additional context about what type of analysis this is (e.g., 'debt analysis', 'liquidity analysis', 'QoE analysis')"
-          },
-          "api_key": {
-            "type": "string",
-            "description": "OpenRouter API key (optional, can be set via environment variable)"
-          },
-          "save_to": {
-            "type": "string",
-            "description": "Optional key to save the critique results to in memory store"
-          },
-          "model": {
-            "type": "string",
-            "description": "Model to use (default: deepseek/deepseek-r1-0528:free)",
-            "default": "deepseek/deepseek-r1-0528:free"
-          },
-          "timeout": {
-            "type": "number",
-            "description": "API request timeout in seconds (default: 120)",
-            "default": 120
-          },
-          "severity_threshold": {
-            "type": "string",
-            "description": "Minimum severity level to report (default: 'low')",
-            "enum": ["critical", "high", "medium", "low"],
-            "default": "low"
-          }
-        },
-        "required": ["response_to_critique"],
-        "additionalProperties": false
+        "required": [
+          "ticker",
+          "recommendation_type"
+        ]
       }
     }
   ]

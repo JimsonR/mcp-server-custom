@@ -5,3 +5,5 @@ pydantic
 azure-functions
 openai
 python-dotenv
+yfinance
+pandas

@@ -9,16 +9,17 @@ import json
 
 # from src.search_modules import SearchModulesHandler
 from src.dynamic_tool import DynamicToolHandler
-from src.local_tools import (
-    MemoryStoreTool, 
-    MemoryMutateTool, 
-    CreateVariableTool, 
-    DebtAnalystTool,
-    LiquidityAnalystTool,
-    QOEAnalystTool,
-    AssetQualityAnalystTool,
-    CriticAgentTool,
-    ConsolidatedCriticTool
+
+from src.yfinance_tools import (
+    GetHistoricalStockPricesTool,
+    GetStockInfoTool,
+    GetYahooFinanceNewsTool,
+    GetStockActionsTool,
+    GetFinancialStatementTool,
+    GetHolderInfoTool,
+    GetOptionExpirationDatesTool,
+    GetOptionChainTool,
+    GetRecommendationsTool,
 )
 
 
@@ -111,36 +112,42 @@ class ToolRegistry:
             try:
                 if tool_config.get("api_base") == "local":
                     local_tool_type = tool_config.get("local_tool") or tool_config.get("handler")
-                    if local_tool_type == "memory_store":
-                        tool = MemoryStoreTool(tool_config)
+                    if local_tool_type == "get_historical_stock_prices":
+                        tool = GetHistoricalStockPricesTool(tool_config)
                         self.tools[tool.name] = tool
-                        logger.info(f"Registered local tool: {tool.name}")
-                    elif local_tool_type == "memory_mutate":
-                        tool = MemoryMutateTool(tool_config)
+                        logger.info(f"Registered yfinance tool: {tool.name}")
+                    elif local_tool_type == "get_stock_info":
+                        tool = GetStockInfoTool(tool_config)
                         self.tools[tool.name] = tool
-                        logger.info(f"Registered local tool: {tool.name}")
-                    elif local_tool_type == "create_variable":
-                        tool = CreateVariableTool(tool_config)
+                        logger.info(f"Registered yfinance tool: {tool.name}")
+                    elif local_tool_type == "get_yahoo_finance_news":
+                        tool = GetYahooFinanceNewsTool(tool_config)
                         self.tools[tool.name] = tool
-                        logger.info(f"Registered local tool: {tool.name}")
-                    elif local_tool_type in ["debt_analyst_agent", "liquidity_analyst_agent", "qoe_analyst_agent", "asset_quality_analyst_agent", "critic_agent", "consolidated_analyst_critique"]:
-                        # Create analyst tool
-                        if local_tool_type == "debt_analyst_agent":
-                            tool = DebtAnalystTool(tool_config)
-                        elif local_tool_type == "liquidity_analyst_agent":
-                            tool = LiquidityAnalystTool(tool_config)
-                        elif local_tool_type == "qoe_analyst_agent":
-                            tool = QOEAnalystTool(tool_config)
-                        elif local_tool_type == "asset_quality_analyst_agent":
-                            tool = AssetQualityAnalystTool(tool_config)
-                        elif local_tool_type == "critic_agent":
-                            tool = CriticAgentTool(tool_config)
-                        elif local_tool_type == "consolidated_analyst_critique":
-                            tool = ConsolidatedCriticTool(tool_config)
-                        
-                        # Inject memory tools - will be resolved after all tools are loaded
+                        logger.info(f"Registered yfinance tool: {tool.name}")
+                    elif local_tool_type == "get_stock_actions":
+                        tool = GetStockActionsTool(tool_config)
                         self.tools[tool.name] = tool
-                        logger.info(f"Registered local tool: {tool.name} (analyst agent)")
+                        logger.info(f"Registered yfinance tool: {tool.name}")
+                    elif local_tool_type == "get_financial_statement":
+                        tool = GetFinancialStatementTool(tool_config)
+                        self.tools[tool.name] = tool
+                        logger.info(f"Registered yfinance tool: {tool.name}")
+                    elif local_tool_type == "get_holder_info":
+                        tool = GetHolderInfoTool(tool_config)
+                        self.tools[tool.name] = tool
+                        logger.info(f"Registered yfinance tool: {tool.name}")
+                    elif local_tool_type == "get_option_expiration_dates":
+                        tool = GetOptionExpirationDatesTool(tool_config)
+                        self.tools[tool.name] = tool
+                        logger.info(f"Registered yfinance tool: {tool.name}")
+                    elif local_tool_type == "get_option_chain":
+                        tool = GetOptionChainTool(tool_config)
+                        self.tools[tool.name] = tool
+                        logger.info(f"Registered yfinance tool: {tool.name}")
+                    elif local_tool_type == "get_recommendations":
+                        tool = GetRecommendationsTool(tool_config)
+                        self.tools[tool.name] = tool
+                        logger.info(f"Registered yfinance tool: {tool.name}")
                     else:
                         logger.warning(
                             f"Unknown local tool '{tool_name}' (local_tool={local_tool_type}), skipping"
@@ -159,45 +166,6 @@ class ToolRegistry:
                 logger.warning(
                     f"Failed to register tool '{tool_name}': {e}"
                 )
-
-        # Second pass: inject memory tools into analyst agents
-        self._inject_memory_tools_to_analysts()
-
-    def _inject_memory_tools_to_analysts(self) -> None:
-        """Inject memory_tool and mutate_tool into analyst agents after all tools are loaded."""
-        # Find memory tools and critic tool
-        memory_tool = None
-        mutate_tool = None
-        critic_tool = None
-        
-        for tool in self.tools.values():
-            if isinstance(tool, MemoryStoreTool):
-                memory_tool = tool
-            elif isinstance(tool, MemoryMutateTool):
-                mutate_tool = tool
-            elif isinstance(tool, CriticAgentTool):
-                critic_tool = tool
-        
-        if not memory_tool:
-            logger.warning("No MemoryStoreTool found - analyst agents will not have memory access")
-            return
-        
-        # Inject into analyst agents and critic agent
-        analyst_count = 0
-        for tool in self.tools.values():
-            if isinstance(tool, (DebtAnalystTool, LiquidityAnalystTool, QOEAnalystTool, AssetQualityAnalystTool, CriticAgentTool, ConsolidatedCriticTool)):
-                tool.memory_tool = memory_tool
-                if isinstance(tool, (DebtAnalystTool, LiquidityAnalystTool, QOEAnalystTool, AssetQualityAnalystTool)):
-                    tool.mutate_tool = mutate_tool
-                    # Give analysts access to critic tool
-                    if critic_tool:
-                        tool.critic_tool = critic_tool
-                # Give critic agent access to all tools for context
-                if isinstance(tool, CriticAgentTool):
-                    tool.all_tools = self.tools
-                analyst_count += 1
-        
-        logger.info(f"Injected memory tools into {analyst_count} analyst agent(s)")
 
     # ------------------------------------------------------------------
     # Tool access
