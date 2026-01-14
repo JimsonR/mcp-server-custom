@@ -1,0 +1,41 @@
+# Ignore Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Environment files (keep .env.example if needed)
+.env
+
+# Logs
+*.log
+
+# Test files
+tests/
+*.test.py
+
+# Documentation
+*.md
+docs/
+
+# Build artifacts
+dist/
+build/

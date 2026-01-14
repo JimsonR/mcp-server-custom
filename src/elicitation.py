@@ -220,7 +220,7 @@ class ElicitationHelper:
                 "field": f"tf_vars.{service}.namespace",
                 "question": f"What namespace/prefix should be used for {service}?",
                 "type": "string",
-                "example": "dojo360-ai",
+                "example": "finance-mcp",
             },
             {
                 "field": f"tf_vars.{service}.location",
@@ -292,7 +292,7 @@ class ElicitationHelper:
         if "services" in field_path:
             return ["App Service"]
         if "namespace" in field_path:
-            return "dojo360-ai"
+            return "finance-ai"
         if "location" in field_path:
             return "eastus2"
         if "environment" in field_path:

@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: optum-mcp-server
+    env: python
+    region: oregon  # Change to your preferred region
+    plan: starter  # free tier, upgrade to 'starter' ($7/month) for production
+    branch: main  # Change to your default branch if different
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: PORT
+        sync: false  # Render will set this automatically
+      - key: OPENROUTER_API_KEY
+        sync: false  # Set this in Render dashboard (keep it secret!)
+      - key: FUNCTIONS_CUSTOMHANDLER_PORT
+        value: 1
+    autoDeploy: true  # Auto-deploy on git push

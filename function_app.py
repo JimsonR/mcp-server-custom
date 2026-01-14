@@ -36,7 +36,7 @@ def _ensure_session(session_id: str) -> None:
 def _handle_health(headers: Dict[str, str]) -> func.HttpResponse:
 	payload = {
 		"status": "ok",
-		"service": "dojo360-mcp-server",
+		"service": "finance-mcp-server",
 		"transport": "azure-functions-http",
 		"endpoint": "/api/mcp",
 	}

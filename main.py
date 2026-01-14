@@ -1,5 +1,5 @@
 # main.py
-# Dojo360 MCP Server – Python Implementation
+# finance MCP Server – Python Implementation
 
 from src.utility import add_site_packages_to_sys_path
 add_site_packages_to_sys_path()
@@ -132,7 +132,7 @@ class MCPServer:
                     "resources": {"subscribe": True, "listChanged": True},
                 },
                 "serverInfo": {
-                    "name": "dojo360-mcp-server",
+                    "name": "finance-mcp-server",
                     "version": get_human_version(),
                 },
             },
@@ -152,7 +152,7 @@ class MCPServer:
                         "query": {
                             "type": "string",
                             "description": "The query that the user is interested in.",
-                            "example": "Can you tell me about Dojo360?",
+                            "example": "Can you tell me about finance?",
                         },
                         "limit": {
                             "type": "integer",
@@ -586,7 +586,7 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
     def _handle_health(self):
         response = {
             "status": "ok",
-            "service": "dojo360-mcp-server",
+            "service": "finance-mcp-server",
             "transport": "streamable-http",
             "endpoint": "/api/health_check",
         }
