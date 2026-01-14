@@ -225,6 +225,7 @@ class MCPServer:
             }
 
         content = result.get("content", "")
+        visualization = result.get("visualization")  # Preserve visualization data
 
         # Elicitation handling
         if isinstance(content, dict) and content.get("elicitation"):
@@ -251,24 +252,25 @@ class MCPServer:
                 },
             }
 
+        # Build response content
         if isinstance(content, dict):
-            return {
-                "jsonrpc": "2.0",
-                "id": request.get("id"),
-                "result": {
-                    "content": [{
-                        "type": "text",
-                        "text": json.dumps(content, indent=2),
-                    }]
-                },
-            }
+            text_content = json.dumps(content, indent=2)
+        else:
+            text_content = str(content)
+
+        # Build result with content
+        response_result = {
+            "content": [{"type": "text", "text": text_content}]
+        }
+
+        # Include visualization data if present (for chart tools)
+        if visualization:
+            response_result["visualization"] = visualization
 
         return {
             "jsonrpc": "2.0",
             "id": request.get("id"),
-            "result": {
-                "content": [{"type": "text", "text": str(content)}]
-            },
+            "result": response_result,
         }
 
     def handle_resources_list(self, request: Dict[str, Any]) -> Dict[str, Any]:
