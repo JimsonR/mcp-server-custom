@@ -557,6 +557,13 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
+    def do_HEAD(self):
+        path = self.path.split("?")[0].rstrip("/")
+        if path in ["/api/health_check", "/health"]:
+            self._handle_health(head_only=True)
+        else:
+            self.send_error(404)
+
     def do_OPTIONS(self):
         self.send_response(200)
         self._set_cors_headers()
@@ -583,7 +590,7 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
             "GET, POST, HEAD, OPTIONS",
         )
 
-    def _handle_health(self):
+    def _handle_health(self, head_only=False):
         response = {
             "status": "ok",
             "service": "finance-mcp-server",
@@ -594,7 +601,8 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self._set_cors_headers()
         self.end_headers()
-        self.wfile.write(json.dumps(response).encode("utf-8"))
+        if not head_only:
+            self.wfile.write(json.dumps(response).encode("utf-8"))
 
 
 # ------------------------------------------------------------------
